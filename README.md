@@ -36,19 +36,64 @@ Common fields on every request, all optional except `board`:
 `away1`/`away2` are points still needed by the on-roll player and the
 opponent; both `0` means a money game. `level` is one of `1ply` `2ply`
 `3ply` `4ply` `truncated1` `truncated2` `truncated3` `rollout`. Each extra
-ply costs roughly 20x; `2ply` moves and `3ply` cubes is a good review setting.
+ply costs roughly 20x. `/moves` defaults to `2ply` and `/cube` to `3ply`: the
+standard review setting, and what error rates are quoted at.
 
 | route | extra fields | returns |
 |-------|--------------|---------|
 | `POST /backgammon/moves` | `dice: [d1, d2]`, `include_game_plans` | every legal play best first: `board`, `equity`, `cubeless_equity`, `equity_diff`, `probs` |
 | `POST /backgammon/cube` | | `equity_nd`, `equity_dt`, `equity_dp`, `should_double`, `should_take`, `optimal_action`, `probs` |
 | `POST /backgammon/position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
+| `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `include_luck` | a whole game graded, see below |
 | `POST /backgammon/batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
 | `GET /health` | | `ok`, `model`, `levels` |
 
 Probabilities are `win`, `gammon_win`, `backgammon_win`, `gammon_loss`,
 `backgammon_loss`, from the on-roll player's view (for `/position`, the
 player who just moved). Equities are cubeful unless named cubeless.
+
+## Reviewing a whole game
+
+`POST /backgammon/review` takes the game as one entry per turn, each from
+the perspective of the player on roll, and grades every decision:
+
+```json
+{"jacoby": true, "move_level": "2ply", "cube_level": "3ply", "top_moves": 5,
+ "include_luck": true,
+ "turns": [
+   {"player": 0, "board": [...], "cube_value": 1, "cube_owner": "centered",
+    "away1": 0, "away2": 0, "is_crawford": false,
+    "doubled": false, "response": null,
+    "dice": [3, 1], "played": [...]}
+ ]}
+```
+
+`player` is 0 or 1 (who is on roll), `played` is the board after the move,
+still from the mover's view, or `null` when the roll could not be played.
+A turn that doubles carries `doubled: true` and the opponent's `response`
+(`take` or `pass`); a passed double has no dice and no move. Cube state and
+match score are per turn, so the caller does not need to track them here.
+
+Each turn comes back with:
+
+- `cube`: when a double was legal, the analysis (`equity_nd`, `equity_dt`,
+  `equity_dp`, `optimal_action`, probabilities), the `action` taken, and a
+  verdict for the `doubler` and, after a double, the `taker`: `error` in
+  equity, `grade` (`ok`, `doubtful`, `bad`, `very_bad`, XG's bands at
+  0.02/0.08/0.16) and `mistake` (`missed_double`, `wrong_double`,
+  `wrong_take`, `wrong_pass` or null). `null` when no double was possible.
+- `move`: the `played` move and the `best` move (each with `notation` such
+  as `8/5 6/5` or `bar/22*`, `rank`, `equity`, `equity_diff`, `probs`,
+  `board`), `top` (the top N, plus the played move if it ranked lower),
+  `n_legal`, `forced`, `error` and `grade` (`best` or the bands above).
+  A dance is `{"danced": true}`.
+- `luck`: how lucky the roll was in equity, from the roller's view (needs a
+  cube level of 2-ply or more).
+
+`players[0]` and `players[1]` total it up: move decisions (forced ones
+excluded), errors, grade counts, cube decisions and mistakes, luck, and
+`pr`, XG's Performance Rating: equity lost per unforced decision times 500.
+A 70-turn game reviews in about five seconds.
 
 ## Run locally
 

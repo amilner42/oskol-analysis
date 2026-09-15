@@ -27,6 +27,8 @@ import bgsage
 from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
+from app.review import CUBE_LEVEL, MOVE_LEVEL, ReviewRequest, review_game
+
 LEVELS = (
     "1ply", "2ply", "3ply", "4ply",
     "truncated1", "truncated2", "truncated3",
@@ -60,7 +62,7 @@ class Position(BaseModel):
     away2: int = 0
     is_crawford: bool = False
     jacoby: bool = True
-    level: Level = "2ply"
+    level: Level = MOVE_LEVEL
 
     @field_validator("board")
     @classmethod
@@ -104,7 +106,7 @@ class MovesRequest(Position):
 
 
 class CubeRequest(Position):
-    pass
+    level: Level = CUBE_LEVEL
 
 
 class PositionRequest(Position):
@@ -135,6 +137,18 @@ def _cube(req: CubeRequest) -> dict:
 
 def _position(req: PositionRequest) -> dict:
     return asdict(analyzer(req.level).post_move_analytics(req.board, **req.match_kwargs()))
+
+
+@backgammon.post("/review")
+def review(req: ReviewRequest) -> dict:
+    """Grade a whole game: every cube decision, every move, the luck, totals.
+
+    Defaults to the standard review setting (2-ply moves, 3-ply cubes).
+    """
+    try:
+        return review_game(req, analyzer)
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e)) from e
 
 
 @app.get("/health")
