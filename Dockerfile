@@ -11,4 +11,4 @@ COPY app ./app
 EXPOSE 8080
 # One worker: the engine and its weights load once and are shared by every
 # request; bgsage parallelises multi-ply and rollouts across cores itself.
-CMD ["uvicorn", "app.main:app", "--host", "::", "--port", "8080", "--workers", "1"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

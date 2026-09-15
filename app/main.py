@@ -24,7 +24,7 @@ from dataclasses import asdict
 from typing import Literal
 
 import bgsage
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 LEVELS = (
@@ -36,6 +36,8 @@ Level = Literal[LEVELS]
 Owner = Literal["centered", "player", "opponent"]
 
 app = FastAPI(title="oskol-analysis", version="0.1.0")
+# Routes are namespaced by game; backgammon is the only one so far.
+backgammon = APIRouter(prefix="/backgammon", tags=["backgammon"])
 
 _analyzers: dict[str, bgsage.BgBotAnalyzer] = {}
 _lock = threading.Lock()
@@ -140,19 +142,19 @@ def health() -> dict:
     return {"ok": True, "engine": "bgsage", "model": bgsage.PRODUCTION_MODEL, "levels": LEVELS}
 
 
-@app.post("/moves")
+@backgammon.post("/moves")
 def moves(req: MovesRequest) -> dict:
     """Every legal play for the dice, best first, with equities and probabilities."""
     return _moves(req)
 
 
-@app.post("/cube")
+@backgammon.post("/cube")
 def cube(req: CubeRequest) -> dict:
     """The pre-roll cube decision: no double, double/take, double/pass equities."""
     return _cube(req)
 
 
-@app.post("/position")
+@backgammon.post("/position")
 def position(req: PositionRequest) -> dict:
     """A post-move position, before the opponent rolls."""
     return _position(req)
@@ -165,7 +167,7 @@ _KINDS = {
 }
 
 
-@app.post("/batch")
+@backgammon.post("/batch")
 def batch(req: BatchRequest) -> dict:
     """Several evaluations in one round trip, answered in order.
 
@@ -182,3 +184,6 @@ def batch(req: BatchRequest) -> dict:
         jobs.append((run, parsed))
     results = list(_batch_pool.map(lambda job: job[0](job[1]), jobs))
     return {"results": results}
+
+
+app.include_router(backgammon)

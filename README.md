@@ -10,6 +10,9 @@ starts on the next request (a few seconds of cold start).
 
 ## API
 
+Routes are namespaced by game (`/backgammon/...`); there is no auth, the
+network is the boundary.
+
 Every position is Open Sage's 26-int board, **from the perspective of the
 player on roll**:
 
@@ -37,10 +40,10 @@ ply costs roughly 20x; `2ply` moves and `3ply` cubes is a good review setting.
 
 | route | extra fields | returns |
 |-------|--------------|---------|
-| `POST /moves` | `dice: [d1, d2]`, `include_game_plans` | every legal play best first: `board`, `equity`, `cubeless_equity`, `equity_diff`, `probs` |
-| `POST /cube` | | `equity_nd`, `equity_dt`, `equity_dp`, `should_double`, `should_take`, `optimal_action`, `probs` |
-| `POST /position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
-| `POST /batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
+| `POST /backgammon/moves` | `dice: [d1, d2]`, `include_game_plans` | every legal play best first: `board`, `equity`, `cubeless_equity`, `equity_diff`, `probs` |
+| `POST /backgammon/cube` | | `equity_nd`, `equity_dt`, `equity_dp`, `should_double`, `should_take`, `optimal_action`, `probs` |
+| `POST /backgammon/position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
+| `POST /backgammon/batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
 | `GET /health` | | `ok`, `model`, `levels` |
 
 Probabilities are `win`, `gammon_win`, `backgammon_win`, `gammon_loss`,
@@ -53,7 +56,7 @@ player who just moved). Equities are cubeful unless named cubeless.
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
 .venv/bin/uvicorn app.main:app --port 8080
-curl -s localhost:8080/moves -H 'content-type: application/json' \
+curl -s localhost:8080/backgammon/moves -H 'content-type: application/json' \
   -d '{"board":[0,-2,0,0,0,0,5,0,3,0,0,0,-5,5,0,0,0,-3,0,-5,0,0,0,0,2,0],"dice":[3,1]}'
 ```
 

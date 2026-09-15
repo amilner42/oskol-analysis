@@ -14,7 +14,7 @@ def test_health():
 
 
 def test_opening_31_plays_the_5_point():
-    r = client.post("/moves", json={"board": START, "dice": [3, 1], "level": "1ply"})
+    r = client.post("/backgammon/moves", json={"board": START, "dice": [3, 1], "level": "1ply"})
     assert r.status_code == 200
     body = r.json()
     best = body["moves"][0]
@@ -26,7 +26,7 @@ def test_opening_31_plays_the_5_point():
 
 
 def test_opening_is_no_double_take():
-    r = client.post("/cube", json={"board": START, "level": "1ply"})
+    r = client.post("/backgammon/cube", json={"board": START, "level": "1ply"})
     assert r.status_code == 200
     body = r.json()
     assert body["should_double"] is False
@@ -35,14 +35,14 @@ def test_opening_is_no_double_take():
 
 
 def test_post_move_position():
-    r = client.post("/position", json={"board": START, "level": "1ply"})
+    r = client.post("/backgammon/position", json={"board": START, "level": "1ply"})
     assert r.status_code == 200
     probs = r.json()["probs"]
     assert 0 <= probs["gammon_win"] <= probs["win"] <= 1
 
 
 def test_batch_keeps_order():
-    r = client.post("/batch", json={"items": [
+    r = client.post("/backgammon/batch", json={"items": [
         {"kind": "cube", "request": {"board": START, "level": "1ply"}},
         {"kind": "moves", "request": {"board": START, "dice": [3, 1], "level": "1ply"}},
     ]})
@@ -55,18 +55,18 @@ def test_batch_keeps_order():
 def test_rejects_bad_board():
     bad = list(START)
     bad[24] = 20
-    r = client.post("/cube", json={"board": bad})
+    r = client.post("/backgammon/cube", json={"board": bad})
     assert r.status_code == 422
 
 
 def test_rejects_bad_batch_item_before_running():
-    r = client.post("/batch", json={"items": [
+    r = client.post("/backgammon/batch", json={"items": [
         {"kind": "moves", "request": {"board": START, "dice": [7, 1]}},
     ]})
     assert r.status_code == 422
 
 
 def test_match_play_cube():
-    r = client.post("/cube", json={"board": START, "away1": 2, "away2": 2, "level": "1ply"})
+    r = client.post("/backgammon/cube", json={"board": START, "away1": 2, "away2": 2, "level": "1ply"})
     assert r.status_code == 200
     assert r.json()["optimal_action"] in ("No Double", "Double/Take", "Double/Pass")
