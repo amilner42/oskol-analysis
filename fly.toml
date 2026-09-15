@@ -38,5 +38,5 @@ kill_signal = 'SIGTERM'
 # Dedicated cores: a review runs every decision at 4-ply across a process
 # pool sized to them (app.pool). Shared CPUs throttle sustained work.
 [[vm]]
-  size = 'performance-4x'
-  memory = '8gb'
+  size = 'performance-8x'
+  memory = '16gb'
