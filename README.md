@@ -4,7 +4,8 @@ The [Open Sage](https://github.com/markbgsage/bgsage) backgammon engine
 (MPL-2.0, XG-strength) behind a small private HTTP API, for
 [Oskol](https://oskol.io)'s backgammon analysis.
 
-Runs on Fly as `oskol-analysis` with no public IP. Inside the Fly org it
+Runs on Fly as `oskol-analysis` (performance-4x: 4 dedicated cores, 8 GB)
+with no public IP. Inside the Fly org it
 answers at `http://oskol-analysis.flycast`; the machine stops when idle and
 starts on the next request (a few seconds of cold start).
 
@@ -36,8 +37,8 @@ Common fields on every request, all optional except `board`:
 `away1`/`away2` are points still needed by the on-roll player and the
 opponent; both `0` means a money game. `level` is one of `1ply` `2ply`
 `3ply` `4ply` `truncated1` `truncated2` `truncated3` `rollout`. Each extra
-ply costs roughly 20x. `/moves` defaults to `2ply` and `/cube` to `3ply`: the
-standard review setting, and what error rates are quoted at.
+ply costs roughly 20x. `/moves` defaults to `2ply` and `/cube` to `3ply`, the
+quick setting; `/review` defaults to `4ply` for both.
 
 | route | extra fields | returns |
 |-------|--------------|---------|
@@ -46,7 +47,7 @@ standard review setting, and what error rates are quoted at.
 | `POST /backgammon/position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
 | `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `include_luck` | a whole game graded, see below |
 | `POST /backgammon/batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
-| `GET /health` | | `ok`, `model`, `levels` |
+| `GET /health` | | `ok`, `model`, `levels`, `review_workers`, `engine_threads` |
 
 Probabilities are `win`, `gammon_win`, `backgammon_win`, `gammon_loss`,
 `backgammon_loss`, from the on-roll player's view (for `/position`, the
@@ -55,10 +56,11 @@ player who just moved). Equities are cubeful unless named cubeless.
 ## Reviewing a whole game
 
 `POST /backgammon/review` takes the game as one entry per turn, each from
-the perspective of the player on roll, and grades every decision:
+the perspective of the player on roll, and grades every decision, by
+default at 4-ply (what XG's own analysis reads as accurate):
 
 ```json
-{"jacoby": true, "move_level": "2ply", "cube_level": "3ply", "top_moves": 5,
+{"jacoby": true, "move_level": "4ply", "cube_level": "4ply", "top_moves": 5,
  "include_luck": true,
  "turns": [
    {"player": 0, "board": [...], "cube_value": 1, "cube_owner": "centered",
@@ -88,12 +90,30 @@ Each turn comes back with:
   `n_legal`, `forced`, `error` and `grade` (`best` or the bands above).
   A dance is `{"danced": true}`.
 - `luck`: how lucky the roll was in equity, from the roller's view (needs a
-  cube level of 2-ply or more).
+  cube level of 2-ply or more). It reads the per-roll equities of a cube
+  analysis at the cube level, but never deeper than 3-ply (so 2-ply luck,
+  `level_label`): bgsage's 4-ply cube analysis goes wrong when asked for
+  those per-roll details, so at 4-ply the graded cube analysis runs without
+  them and luck gets its own 3-ply one.
 
 `players[0]` and `players[1]` total it up: move decisions (forced ones
 excluded), errors, grade counts, cube decisions and mistakes, luck, and
 `pr`, XG's Performance Rating: equity lost per unforced decision times 500.
-A 70-turn game reviews in about five seconds.
+The response also echoes `levels` (`{move, cube, luck}`, the analysis
+levels used; `luck` is null when no luck was computed) and `timing_ms`, the
+review's wall time.
+
+Bad input 422s with the turn index before any engine time is spent (a
+double that was not legal, a played board that is not a legal move for the
+dice). Then the turns fan out over a process pool (`app/pool.py`): one
+worker per core, each loading its engines once and keeping them, results
+back in turn order. A turn's analysis depends only on that turn, so the
+parallel review returns exactly what a serial one would. `REVIEW_WORKERS`
+(default: the cores) and `REVIEW_ENGINE_THREADS` (bgsage threads per worker,
+default cores / workers, at least 2) tune it; `REVIEW_WORKERS=1` reviews
+serially in the server process. A 4-ply review is mostly the checker plays
+(about 6 CPU-seconds a turn on an M-series core, more on a busy midgame):
+a 70-turn game took 111 s locally with 4 workers.
 
 ## Run locally
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict
 from typing import Literal
 
@@ -27,14 +28,10 @@ import bgsage
 from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from app.review import CUBE_LEVEL, MOVE_LEVEL, ReviewRequest, review_game
+from app import pool
+from app.review import (CUBE_LEVEL, LEVELS, MOVE_LEVEL, Level, ReviewRequest,
+                        analyze_serially, review_game)
 
-LEVELS = (
-    "1ply", "2ply", "3ply", "4ply",
-    "truncated1", "truncated2", "truncated3",
-    "rollout",
-)
-Level = Literal[LEVELS]
 Owner = Literal["centered", "player", "opponent"]
 
 app = FastAPI(title="oskol-analysis", version="0.1.0")
@@ -143,17 +140,22 @@ def _position(req: PositionRequest) -> dict:
 def review(req: ReviewRequest) -> dict:
     """Grade a whole game: every cube decision, every move, the luck, totals.
 
-    Defaults to the standard review setting (2-ply moves, 3-ply cubes).
+    Defaults to 4-ply moves and cubes, the turns spread over a process pool
+    (app.pool). The response echoes the `levels` used and the `timing_ms`.
     """
+    analyze = pool.analyze_in_parallel if pool.workers() > 1 else analyze_serially(analyzer)
     try:
-        return review_game(req, analyzer)
+        return review_game(req, analyze)
     except ValueError as e:
         raise HTTPException(422, detail=str(e)) from e
+    except BrokenProcessPool as e:
+        raise HTTPException(503, detail="an analysis worker died; try again") from e
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "engine": "bgsage", "model": bgsage.PRODUCTION_MODEL, "levels": LEVELS}
+    return {"ok": True, "engine": "bgsage", "model": bgsage.PRODUCTION_MODEL, "levels": LEVELS,
+            "review_workers": pool.workers(), "engine_threads": pool.engine_threads()}
 
 
 @backgammon.post("/moves")

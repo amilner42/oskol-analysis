@@ -9,15 +9,34 @@ equity lost) and the luck of the roll, plus per-player totals.
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
-from typing import Literal
+from typing import Callable, Iterable, Literal
 
 import bgsage
 from bgsage.text_export import compute_move_notation
 from pydantic import BaseModel, Field, model_validator
 
-MOVE_LEVEL = "2ply"   # the standard review setting: what error rates are quoted at
+LEVELS = (
+    "1ply", "2ply", "3ply", "4ply",
+    "truncated1", "truncated2", "truncated3",
+    "rollout",
+)
+Level = Literal[LEVELS]
+
+MOVE_LEVEL = "2ply"   # /moves and /cube: the quick standard setting
 CUBE_LEVEL = "3ply"
+# A review grades every decision at 4-ply: XG-grade numbers, run in parallel
+# across the machine's cores (app.pool).
+REVIEW_MOVE_LEVEL = "4ply"
+REVIEW_CUBE_LEVEL = "4ply"
+# Luck reads the per-roll equities of a cube analysis run with
+# incl_2ply_details. bgsage 2.0.20260907 corrupts a 4-ply cube analysis when
+# asked for those details (ND/DT drift by ~0.1 and change with the thread
+# count), so luck gets its own analysis, never deeper than 3-ply (2-ply luck),
+# and the graded cube analysis never asks for details at 4-ply.
+LUCK_LEVEL = "3ply"
+_PLY = {"1ply": 1, "2ply": 2, "3ply": 3, "4ply": 4}
 
 # Equity lost, in the doubler's or mover's units. XG's bands.
 GRADES = ((0.16, "very_bad"), (0.08, "bad"), (0.02, "doubtful"))
@@ -61,8 +80,8 @@ class Turn(BaseModel):
 class ReviewRequest(BaseModel):
     turns: list[Turn] = Field(min_length=1, max_length=1000)
     jacoby: bool = True
-    move_level: str = MOVE_LEVEL
-    cube_level: str = CUBE_LEVEL
+    move_level: Level = REVIEW_MOVE_LEVEL
+    cube_level: Level = REVIEW_CUBE_LEVEL
     top_moves: int = Field(default=5, ge=1, le=50)
     include_luck: bool = True
 
@@ -165,29 +184,108 @@ def count(bucket: dict, key: str | None) -> None:
         bucket[key] = bucket.get(key, 0) + 1
 
 
-def review_game(req: ReviewRequest, analyzer) -> dict:
-    move_engine = analyzer(req.move_level)
-    cube_engine = analyzer(req.cube_level)
-    totals = {0: new_totals(), 1: new_totals()}
-    turns_out = []
-    # Luck comes from the cube analysis's per-roll equities, which need 2-ply or deeper.
-    want_luck = req.include_luck and req.cube_level != "1ply"
+def luck_level(cube_level: str) -> str | None:
+    """The cube analysis luck is read from, or None when there is no luck to be had.
 
+    Luck needs per-roll equities, which a 1-ply cube analysis does not carry.
+    Up to 3-ply they come from the graded cube analysis itself; deeper, from a
+    separate 3-ply one (see LUCK_LEVEL).
+    """
+    ply = _PLY.get(cube_level)
+    if ply == 1:
+        return None
+    if ply is None or ply > _PLY[LUCK_LEVEL]:
+        return LUCK_LEVEL
+    return cube_level
+
+
+def levels(req: ReviewRequest) -> dict:
+    return {"move": req.move_level, "cube": req.cube_level,
+            "luck": luck_level(req.cube_level) if req.include_luck else None}
+
+
+def validate(req: ReviewRequest) -> None:
+    """Every check that needs no evaluation, before any engine time is spent.
+
+    Raises ValueError naming the first bad turn, so a caller's encoder bug
+    422s at once instead of after minutes of 4-ply analysis.
+    """
     for index, turn in enumerate(req.turns):
-        match = dict(cube_value=turn.cube_value, cube_owner=turn.cube_owner,
-                     away1=turn.away1, away2=turn.away2,
-                     is_crawford=turn.is_crawford, jacoby=req.jacoby)
-        me, them = totals[turn.player], totals[1 - turn.player]
-        out: dict = {"index": index, "player": turn.player, "dice": turn.dice,
-                     "cube": None, "move": None, "luck": None}
+        if turn.doubled and not can_double(turn):
+            raise ValueError(f"turns[{index}]: a double was not legal here")
+        if turn.dice is None:
+            continue
+        legal = bgsage.possible_moves(turn.board, *turn.dice)
+        if not legal:
+            if turn.played is not None and turn.played != turn.board:
+                raise ValueError(f"turns[{index}]: no legal move, but a move was played")
+        elif turn.played is None:
+            raise ValueError(f"turns[{index}]: dice were rolled but no move was played")
+        elif turn.played not in legal:
+            raise ValueError(f"turns[{index}]: played board is not a legal move for these dice")
 
-        legal_double = can_double(turn)
-        cube_analysis = None
-        if legal_double or want_luck:
-            cube_analysis = cube_engine.cube_action(
-                turn.board, incl_2ply_details=want_luck, **match)
-        if legal_double:
-            out["cube"] = review_cube(turn, cube_analysis)
+
+def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
+    """One turn's engine work: its cube decision, its luck, its move.
+
+    Depends on nothing but the turn and the request, so turns can be analysed
+    in any order, on any process, and still come out the same.
+    """
+    match = dict(cube_value=turn.cube_value, cube_owner=turn.cube_owner,
+                 away1=turn.away1, away2=turn.away2,
+                 is_crawford=turn.is_crawford, jacoby=req.jacoby)
+    out: dict = {"index": index, "player": turn.player, "dice": turn.dice,
+                 "cube": None, "move": None, "luck": None}
+
+    lucky = luck_level(req.cube_level) if req.include_luck and turn.dice is not None else None
+    cube_analysis = luck_analysis = None
+    if can_double(turn):
+        shared = lucky == req.cube_level
+        cube_analysis = analyzer(req.cube_level).cube_action(
+            turn.board, incl_2ply_details=shared, **match)
+        out["cube"] = review_cube(turn, cube_analysis)
+        if shared:
+            luck_analysis = cube_analysis
+    if lucky and luck_analysis is None:
+        luck_analysis = analyzer(lucky).cube_action(turn.board, incl_2ply_details=True, **match)
+
+    if turn.dice is not None:
+        d1, d2 = turn.dice
+        if luck_analysis is not None:
+            luck = bgsage.roll_luck(luck_analysis, d1, d2, is_opening_roll=index == 0)
+            if luck is not None:
+                out["luck"] = {"luck": luck.luck, "actual_equity": luck.actual_equity,
+                               "average_equity": luck.average_equity,
+                               "level_label": luck.level_label}
+        if not bgsage.possible_moves(turn.board, d1, d2):
+            out["move"] = {"danced": True, "n_legal": 0}
+        else:
+            result = analyzer(req.move_level).checker_play(turn.board, d1, d2, **match)
+            try:
+                out["move"] = review_move(turn, result, req.top_moves)
+            except ValueError as e:
+                raise ValueError(f"turns[{index}]: {e}") from e
+    return out
+
+
+Mapper = Callable[[ReviewRequest], Iterable[dict]]
+
+
+def analyze_serially(analyzer) -> Mapper:
+    return lambda req: (analyze_turn(i, t, req, analyzer) for i, t in enumerate(req.turns))
+
+
+def review_game(req: ReviewRequest, analyze: Mapper) -> dict:
+    """Grade a game. `analyze` runs analyze_turn over every turn and yields the
+    results in turn order (serially here, or across processes: app.pool)."""
+    started = time.monotonic()
+    validate(req)
+    turns_out = list(analyze(req))
+
+    totals = {0: new_totals(), 1: new_totals()}
+    for out in turns_out:
+        me, them = totals[out["player"]], totals[1 - out["player"]]
+        if out["cube"]:
             me["cube"]["decisions"] += 1
             me["cube"]["error"] += out["cube"]["doubler"]["error"]
             count(me["cube"]["mistakes"], out["cube"]["doubler"]["mistake"])
@@ -195,39 +293,16 @@ def review_game(req: ReviewRequest, analyzer) -> dict:
                 them["cube"]["decisions"] += 1
                 them["cube"]["error"] += out["cube"]["taker"]["error"]
                 count(them["cube"]["mistakes"], out["cube"]["taker"]["mistake"])
-        elif turn.doubled:
-            raise ValueError(f"turns[{index}]: a double was not legal here")
-
-        if turn.dice is not None:
-            d1, d2 = turn.dice
-            if want_luck and cube_analysis is not None:
-                luck = bgsage.roll_luck(cube_analysis, d1, d2, is_opening_roll=index == 0)
-                if luck is not None:
-                    out["luck"] = {"luck": luck.luck, "actual_equity": luck.actual_equity,
-                                   "average_equity": luck.average_equity,
-                                   "level_label": luck.level_label}
-                    me["luck"] += luck.luck
-            legal = bgsage.possible_moves(turn.board, d1, d2)
-            if not legal:
-                if turn.played is not None and turn.played != turn.board:
-                    raise ValueError(f"turns[{index}]: no legal move, but a move was played")
-                out["move"] = {"danced": True, "n_legal": 0}
+        if out["luck"]:
+            me["luck"] += out["luck"]["luck"]
+        m = out["move"]
+        if m and not m.get("danced"):
+            if m["forced"]:
+                me["moves"]["forced"] += 1
             else:
-                if turn.played is None:
-                    raise ValueError(f"turns[{index}]: dice were rolled but no move was played")
-                result = move_engine.checker_play(turn.board, d1, d2, **match)
-                try:
-                    out["move"] = review_move(turn, result, req.top_moves)
-                except ValueError as e:
-                    raise ValueError(f"turns[{index}]: {e}") from e
-                m = out["move"]
-                if m["forced"]:
-                    me["moves"]["forced"] += 1
-                else:
-                    me["moves"]["decisions"] += 1
-                    me["moves"]["error"] += m["error"]
-                    count(me["moves"]["grades"], m["grade"])
-        turns_out.append(out)
+                me["moves"]["decisions"] += 1
+                me["moves"]["error"] += m["error"]
+                count(me["moves"]["grades"], m["grade"])
 
     for t in totals.values():
         t["error"] = t["moves"]["error"] + t["cube"]["error"]
@@ -236,7 +311,8 @@ def review_game(req: ReviewRequest, analyzer) -> dict:
         t["pr"] = t["error"] / decisions * 500 if decisions else 0.0
 
     return {
-        "levels": {"moves": req.move_level, "cube": req.cube_level},
+        "levels": levels(req),
         "turns": turns_out,
         "players": [totals[0], totals[1]],
+        "timing_ms": round((time.monotonic() - started) * 1000),
     }
