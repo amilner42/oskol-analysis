@@ -6,9 +6,9 @@ the perspective of the player on roll:
   board[1..24]  points, counted from the on-roll player's side: their
                 checkers are positive, the opponent's negative; the on-roll
                 player moves from 24 down to 1 and bears off past 1
-  board[25]     the on-roll player's checkers on the bar (positive)
-  board[0]      the opponent's checkers on the bar (negative)
-  borne-off checkers are not stored (15 minus what is on the board)
+  board[25]     the on-roll player's checkers on the bar (nonnegative count)
+  board[0]      the opponent's checkers on the bar (nonnegative count)
+  borne-off checkers are not stored (15 minus that side's interior and bar)
 
 Cube owner is "centered", "player" (the on-roll player) or "opponent".
 away1/away2 are match scores as points still needed by the on-roll player
@@ -64,12 +64,12 @@ class Position(BaseModel):
     @field_validator("board")
     @classmethod
     def _sane_board(cls, board: list[int]) -> list[int]:
-        mine = sum(n for n in board if n > 0)
-        theirs = -sum(n for n in board if n < 0)
+        if board[25] < 0 or board[0] < 0:
+            raise ValueError("board[25] and board[0] are nonnegative bar counts")
+        mine = board[25] + sum(n for n in board[1:25] if n > 0)
+        theirs = board[0] - sum(n for n in board[1:25] if n < 0)
         if mine > 15 or theirs > 15:
             raise ValueError("more than 15 checkers for one side")
-        if board[25] < 0 or board[0] > 0:
-            raise ValueError("board[25] is the on-roll bar (>= 0), board[0] the opponent's (<= 0)")
         return board
 
     @field_validator("cube_value")

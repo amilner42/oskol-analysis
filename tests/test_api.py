@@ -25,6 +25,29 @@ def test_opening_31_plays_the_5_point():
     assert 0.4 < best["probs"]["win"] < 0.7
 
 
+def test_moves_accepts_an_opponent_checker_on_the_bar():
+    board = list(START)
+    board[1] = -1
+    board[0] = 1
+
+    r = client.post("/backgammon/moves", json={"board": board, "dice": [3, 1], "level": "1ply"})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["moves"]
+    assert all(move["board"][0] == 1 for move in r.json()["moves"])
+
+
+def test_rejects_negative_bar_counts():
+    for bar in (0, 25):
+        board = list(START)
+        board[bar] = -1
+
+        r = client.post("/backgammon/cube", json={"board": board, "level": "1ply"})
+
+        assert r.status_code == 422
+        assert "nonnegative bar counts" in r.json()["detail"][0]["msg"]
+
+
 def test_opening_is_no_double_take():
     r = client.post("/backgammon/cube", json={"board": START, "level": "1ply"})
     assert r.status_code == 200
