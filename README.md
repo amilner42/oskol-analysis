@@ -20,10 +20,13 @@ player on roll**:
 | index   | meaning |
 |---------|---------|
 | 1..24   | points counted from the on-roll player's side; theirs positive, the opponent's negative. They move 24 → 1 and bear off past 1. |
-| 25      | the on-roll player's bar (positive) |
-| 0       | the opponent's bar (negative) |
+| 25      | the on-roll player's bar (nonnegative count) |
+| 0       | the opponent's bar (nonnegative count) |
 
-Borne-off checkers are not stored. The opening position is
+The bar slots are counts, so unlike occupied points they do not use opposing
+signs. Borne-off checkers are not stored: for the on-roll player subtract
+positive interior checkers plus `board[25]` from 15; for the opponent subtract
+the absolute negative interior checkers plus `board[0]`. The opening position is
 `[0,-2,0,0,0,0,5,0,3,0,0,0,-5,5,0,0,0,-3,0,-5,0,0,0,0,2,0]`.
 
 Common fields on every request, all optional except `board`:
@@ -70,8 +73,9 @@ default at 4-ply (what XG's own analysis reads as accurate):
  ]}
 ```
 
-`player` is 0 or 1 (who is on roll), `played` is the board after the move,
-still from the mover's view, or `null` when the roll could not be played.
+`player` is 0 or 1 (who is on roll), and `played` is the board after the move,
+still from the mover's view. When the roll cannot be played, `played` must be
+the unchanged input board.
 A turn that doubles carries `doubled: true` and the opponent's `response`
 (`take` or `pass`); a passed double has no dice and no move. Cube state and
 match score are per turn, so the caller does not need to track them here.
@@ -88,7 +92,8 @@ Each turn comes back with:
   as `8/5 6/5` or `bar/22*`, `rank`, `equity`, `equity_diff`, `probs`,
   `board`), `top` (the top N, plus the played move if it ranked lower),
   `n_legal`, `forced`, `error` and `grade` (`best` or the bands above).
-  A dance is `{"danced": true}`.
+  A dance is `{"danced": true, "n_legal": 0}` and is not counted as a forced
+  move.
 - `luck`: how lucky the roll was in equity, from the roller's view (needs a
   cube level of 2-ply or more). It reads the per-roll equities of a cube
   analysis at the cube level, but never deeper than 3-ply (so 2-ply luck,

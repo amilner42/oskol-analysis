@@ -204,6 +204,11 @@ def levels(req: ReviewRequest) -> dict:
             "luck": luck_level(req.cube_level) if req.include_luck else None}
 
 
+def is_dance(board: list[int], legal: list[list[int]]) -> bool:
+    """Whether the roll moves no checker in either bgsage representation."""
+    return not legal or legal == [board]
+
+
 def validate(req: ReviewRequest) -> None:
     """Every check that needs no evaluation, before any engine time is spent.
 
@@ -216,9 +221,9 @@ def validate(req: ReviewRequest) -> None:
         if turn.dice is None:
             continue
         legal = bgsage.possible_moves(turn.board, *turn.dice)
-        if not legal:
-            if turn.played is not None and turn.played != turn.board:
-                raise ValueError(f"turns[{index}]: no legal move, but a move was played")
+        if is_dance(turn.board, legal):
+            if turn.played != turn.board:
+                raise ValueError(f"turns[{index}]: no legal move; played must equal the unchanged board")
         elif turn.played is None:
             raise ValueError(f"turns[{index}]: dice were rolled but no move was played")
         elif turn.played not in legal:
@@ -257,7 +262,8 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
                 out["luck"] = {"luck": luck.luck, "actual_equity": luck.actual_equity,
                                "average_equity": luck.average_equity,
                                "level_label": luck.level_label}
-        if not bgsage.possible_moves(turn.board, d1, d2):
+        legal = bgsage.possible_moves(turn.board, d1, d2)
+        if is_dance(turn.board, legal):
             out["move"] = {"danced": True, "n_legal": 0}
         else:
             result = analyzer(req.move_level).checker_play(turn.board, d1, d2, **match)

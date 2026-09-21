@@ -11,6 +11,17 @@ client = TestClient(app)
 START = bgsage.STARTING_BOARD
 
 
+def dance_board() -> list[int]:
+    """The mover is on the bar and every entry point is closed."""
+    board = [0] * 26
+    board[25] = 1
+    board[6] = 14
+    board[1] = -3
+    for point in range(19, 25):
+        board[point] = -2
+    return board
+
+
 def self_play(seed: int, max_turns: int = 80) -> list[dict]:
     """A plausible game: 1-ply best moves, no cube. Boards are always on-roll view."""
     rng = random.Random(seed)
@@ -86,6 +97,52 @@ def test_illegal_played_board_is_422():
     r = client.post("/backgammon/review", json={"turns": turns, "move_level": "1ply", "cube_level": "1ply"})
     assert r.status_code == 422
     assert "turns[0]" in r.json()["detail"]
+
+
+def test_a_dance_is_not_counted_as_a_forced_move():
+    board = dance_board()
+    turns = [{"player": 0, "board": board, "dice": [1, 2], "played": board}]
+
+    r = client.post("/backgammon/review", json={
+        "turns": turns,
+        "move_level": "1ply",
+        "cube_level": "1ply",
+        "include_luck": False,
+    })
+
+    assert r.status_code == 200, r.text
+    assert r.json()["turns"][0]["move"] == {"danced": True, "n_legal": 0}
+    assert r.json()["players"][0]["moves"] == {
+        "decisions": 0, "forced": 0, "error": 0.0, "grades": {}}
+
+
+def test_an_empty_legal_move_list_is_also_a_dance(monkeypatch):
+    board = dance_board()
+    monkeypatch.setattr(bgsage, "possible_moves", lambda *_args: [])
+    turns = [{
+        "player": 0,
+        "board": board,
+        "away1": 1,
+        "away2": 3,
+        "is_crawford": True,
+        "dice": [1, 2],
+        "played": board,
+    }]
+
+    r = client.post("/backgammon/review", json={"turns": turns, "include_luck": False})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["turns"][0]["move"] == {"danced": True, "n_legal": 0}
+
+
+def test_a_dance_requires_the_unchanged_played_board():
+    board = dance_board()
+    turns = [{"player": 0, "board": board, "dice": [1, 2], "played": None}]
+
+    r = client.post("/backgammon/review", json={"turns": turns})
+
+    assert r.status_code == 422
+    assert "played must equal the unchanged board" in r.json()["detail"]
 
 
 def test_crawford_has_no_cube():
