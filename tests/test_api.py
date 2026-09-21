@@ -37,6 +37,17 @@ def test_moves_accepts_an_opponent_checker_on_the_bar():
     assert all(move["board"][0] == 1 for move in r.json()["moves"])
 
 
+def test_rejects_negative_bar_counts():
+    for bar in (0, 25):
+        board = list(START)
+        board[bar] = -1
+
+        r = client.post("/backgammon/cube", json={"board": board, "level": "1ply"})
+
+        assert r.status_code == 422
+        assert "nonnegative bar counts" in r.json()["detail"][0]["msg"]
+
+
 def test_opening_is_no_double_take():
     r = client.post("/backgammon/cube", json={"board": START, "level": "1ply"})
     assert r.status_code == 200
