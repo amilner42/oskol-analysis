@@ -294,3 +294,66 @@ def test_a_taken_double_is_graded_like_an_independent_post_take_request():
     assert move["n_legal"] == len(post.moves)
     # The pre-offer cube would have called the same play a mistake.
     assert [m.board for m in pre.moves].index(post.moves[0].board) > 0
+
+
+def test_all_results_is_off_by_default():
+    turns = self_play(6, max_turns=2)
+    r = client.post("/backgammon/review", json={
+        "turns": turns, "move_level": "1ply", "cube_level": "1ply"})
+    assert all("results" not in t["move"] for t in r.json()["turns"])
+    assert ReviewRequest.model_validate({"turns": turns}).all_results is False
+
+
+def test_all_results_carries_every_legal_play_in_rank_order():
+    turns = self_play(6, max_turns=4)
+    r = client.post("/backgammon/review", json={
+        "turns": turns, "move_level": "1ply", "cube_level": "1ply",
+        "top_moves": 2, "all_results": True})
+    assert r.status_code == 200, r.text
+    engine = bgsage.create_analyzer("1ply")
+    for out, turn in zip(r.json()["turns"], turns):
+        move = out["move"]
+        results = move["results"]
+        assert len(results) == move["n_legal"]
+        assert len(move["top"]) <= 3         # top_moves is untouched by this
+        expected = engine.checker_play(list(turn["board"]), *turn["dice"]).moves
+        assert [e["board"] for e in results] == [m.board for m in expected]
+        assert [e["equity_diff"] for e in results] == [m.equity_diff for m in expected]
+        # Rank order: the best first, at no loss, and never improving after.
+        assert results[0]["equity_diff"] == 0.0
+        assert all(a["equity_diff"] >= b["equity_diff"]
+                   for a, b in zip(results, results[1:]))
+        # Compact: a board and its equity loss, nothing else.
+        assert all(set(e) == {"board", "equity_diff"} for e in results)
+        # The played move is in there, with the loss the grade was built from.
+        played = next(e for e in results if e["board"] == move["played"]["board"])
+        assert played["equity_diff"] == move["played"]["equity_diff"]
+
+
+def test_all_results_leaves_the_top_and_the_grades_alone():
+    turns = self_play(6, max_turns=6)
+    body = {"turns": turns, "move_level": "1ply", "cube_level": "1ply"}
+    off = client.post("/backgammon/review", json=body).json()
+    on = client.post("/backgammon/review", json=body | {"all_results": True}).json()
+    for a, b in zip(off["turns"], on["turns"]):
+        assert a == {**b, "move": {k: v for k, v in b["move"].items() if k != "results"}}
+    assert off["players"] == on["players"]
+
+
+def test_a_roll_that_moves_nothing_lists_nothing_extra():
+    # On the bar behind a closed board with 6-5. Whether the engine calls that
+    # no legal move at all (a dance) or the one forced non-move, `results`
+    # never claims more than n_legal, and the played board is the input board.
+    danced = [0] * 26
+    danced[25] = 1                                    # the mover, on the bar
+    for point in range(19, 25):                       # the opponent's home, shut
+        danced[point] = -2
+    danced[1], danced[6], danced[8], danced[10], danced[13] = -3, 5, 3, 1, 5
+    r = client.post("/backgammon/review", json={
+        "turns": [{"player": 0, "board": danced, "dice": [6, 5], "played": danced}],
+        "move_level": "1ply", "cube_level": "1ply", "all_results": True})
+    assert r.status_code == 200, r.text
+    move = r.json()["turns"][0]["move"]
+    assert move["n_legal"] == len(move.get("results", []))
+    assert move.get("danced") or (move["forced"] and move["played"]["board"] == danced)
+    assert r.json()["players"][0]["moves"]["decisions"] == 0    # nothing to decide

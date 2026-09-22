@@ -45,7 +45,7 @@ quick setting; `/review` defaults to `4ply` for both.
 | `POST /backgammon/moves` | `dice: [d1, d2]`, `include_game_plans` | every legal play best first: `board`, `equity`, `cubeless_equity`, `equity_diff`, `probs` |
 | `POST /backgammon/cube` | | `equity_nd`, `equity_dt`, `equity_dp`, `should_double`, `should_take`, `optimal_action`, `probs` |
 | `POST /backgammon/position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
-| `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `include_luck` | a whole game graded, see below |
+| `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `all_results`, `include_luck` | a whole game graded, see below |
 | `POST /backgammon/batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
 | `GET /health` | | `ok`, `model`, `levels`, `review_workers`, `engine_threads` |
 
@@ -61,7 +61,7 @@ default at 4-ply (what XG's own analysis reads as accurate):
 
 ```json
 {"jacoby": true, "move_level": "4ply", "cube_level": "4ply", "top_moves": 5,
- "include_luck": true,
+ "all_results": false, "include_luck": true,
  "turns": [
    {"player": 0, "board": [...], "cube_value": 1, "cube_owner": "centered",
     "away1": 0, "away2": 0, "is_crawford": false,
@@ -74,7 +74,12 @@ default at 4-ply (what XG's own analysis reads as accurate):
 still from the mover's view, or `null` when the roll could not be played.
 A turn that doubles carries `doubled: true` and the opponent's `response`
 (`take` or `pass`); a passed double has no dice and no move. Cube state and
-match score are per turn, so the caller does not need to track them here.
+match score are per turn, so the caller does not need to track them here,
+and they are the cube **as the turn opened**, before any double was offered.
+The cube decision is graded on that, because it is what the doubler was
+looking at; the checker play that follows a take is evaluated on the cube
+the take left behind — twice the value, owned by the taker — because that is
+what the mover is really playing on.
 
 Each turn comes back with:
 
@@ -89,6 +94,17 @@ Each turn comes back with:
   `board`), `top` (the top N, plus the played move if it ranked lower),
   `n_legal`, `forced`, `error` and `grade` (`best` or the bands above).
   A dance is `{"danced": true}`.
+  With `all_results: true` it also carries `results`: every legal play,
+  best first, as `{board, equity_diff}` and nothing else — the same board
+  encoding and the same best-relative `equity_diff` (0 for the best, negative
+  for the rest) the entries in `top` use. The engine evaluates every legal
+  move either way; `top_moves` only truncates the reply, so this costs
+  nothing but bytes, and it is what a caller needs to grade an answer that
+  did not make the top few. It is off by default: at 1-ply on self-played
+  games a typical turn (10 legal plays) grows from about 3.2 KB to 4.3 KB,
+  and the worst doubles turn measured (1-1, 357 legal plays) from 3.3 KB to
+  40 KB — roughly 105 bytes a play. A whole 63-turn game went from 181 KB to
+  323 KB. `top` is unchanged by the flag.
 - `luck`: how lucky the roll was in equity, from the roller's view (needs a
   cube level of 2-ply or more). It reads the per-roll equities of a cube
   analysis at the cube level, but never deeper than 3-ply (so 2-ply luck,
