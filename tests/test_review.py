@@ -1,6 +1,7 @@
 import random
 
 import bgsage
+import pytest
 from fastapi.testclient import TestClient
 
 from app import pool
@@ -174,12 +175,14 @@ class Spy:
 
         class Engine:
             def cube_action(self, board, incl_2ply_details=False, **kw):
-                outer.cube_calls.append(kw)
+                outer.cube_calls.append({"board": board, "level": level,
+                                         "details": incl_2ply_details, **kw})
                 engine = analyzer("2ply") if incl_2ply_details else outer.engine
                 return engine.cube_action(board, incl_2ply_details=incl_2ply_details, **kw)
 
             def checker_play(self, board, d1, d2, **kw):
-                outer.play_calls.append(kw)
+                outer.play_calls.append({"board": board, "level": level,
+                                         "dice": (d1, d2), **kw})
                 return outer.engine.checker_play(board, d1, d2, **kw)
 
         return Engine()
@@ -224,13 +227,29 @@ def test_a_redouble_taken_hands_the_doubled_cube_back():
     assert [cube_context(c) for c in spy.play_calls] == [(4, "opponent")]
 
 
-def test_both_orientations_see_the_same_post_take_cube():
-    # Boards and cube owner are always relative to the player on roll, so who
-    # is doubling (player 0 or 1) changes nothing about the context.
+def test_both_orientations_send_the_mover_relative_board_untouched():
+    # Every board is already relative to the player on roll, so `player` is a
+    # label the review carries and never a reason to flip anything: player 1's
+    # turn reaches the engine exactly as player 0's does, same board, same
+    # dice, same post-take cube. A flip or a swap of away scores fails here.
+    board = list(CUBE_SENSITIVE)
+    played = bgsage.create_analyzer("1ply").checker_play(
+        board, 2, 5, cube_value=2, cube_owner="opponent").moves[0].board
+    seen = {}
     for player in (0, 1):
-        spy = spy_on([doubled_turn(player=player)])
-        assert [cube_context(c) for c in spy.play_calls] == [(2, "opponent")]
+        spy = spy_on([{"player": player, "board": board, "doubled": True,
+                       "response": "take", "dice": [2, 5], "played": played,
+                       "away1": 5, "away2": 3}])
         assert spy.body["turns"][0]["player"] == player
+        assert [c["board"] for c in spy.play_calls] == [board]
+        assert [c["board"] for c in spy.cube_calls] == [board]
+        assert (spy.play_calls[0]["away1"], spy.play_calls[0]["away2"]) == (5, 3)
+        assert spy.play_calls[0]["dice"] == (2, 5)
+        seen[player] = (spy.cube_calls + spy.play_calls, spy.body["turns"][0]["move"])
+    calls0, move0 = seen[0]
+    calls1, move1 = seen[1]
+    assert calls0 == calls1 and move0 == move1
+    assert cube_context(seen[0][0][-1]) == (2, "opponent")
 
 
 def test_a_take_at_a_match_score_keeps_the_score_and_doubles_the_cube():
@@ -296,6 +315,51 @@ def test_a_taken_double_is_graded_like_an_independent_post_take_request():
     assert [m.board for m in pre.moves].index(post.moves[0].board) > 0
 
 
+def test_luck_after_a_take_is_measured_on_the_doubled_cube():
+    # The roll happens after the take, so how lucky it was is a question about
+    # the doubled cube. Luck can no longer ride on the graded cube analysis,
+    # which is deliberately the pre-offer one: it gets its own call.
+    spy = spy_on([doubled_turn()], cube_level="2ply", include_luck=True)
+    assert [(cube_context(c), c["details"]) for c in spy.cube_calls] == [
+        ((1, "centered"), False),        # graded: the cube the doubler faced
+        ((2, "opponent"), True),         # luck: the cube the roll happened on
+    ]
+    assert {c["level"] for c in spy.cube_calls} == {"2ply"}
+    assert spy.body["turns"][0]["luck"] is not None
+
+    # A turn that did not double rolls on the cube it was already holding, so
+    # one analysis still serves both and nothing extra is spent.
+    spy = spy_on(self_play(5, max_turns=1), cube_level="2ply", include_luck=True)
+    assert [(cube_context(c), c["details"]) for c in spy.cube_calls] == [((1, "centered"), True)]
+
+
+def test_luck_after_a_take_matches_an_independent_post_take_analysis():
+    # Not the first turn of the request: an opening roll is averaged without
+    # doubles, and a double is never offered before one.
+    engine = bgsage.create_analyzer("1ply")
+    played = engine.checker_play(list(CUBE_SENSITIVE), 2, 5,
+                                 cube_value=2, cube_owner="opponent").moves[0].board
+    turns = self_play(5, max_turns=1) + [
+        {"player": 1, "board": CUBE_SENSITIVE, "doubled": True, "response": "take",
+         "dice": [2, 5], "played": played}]
+    r = client.post("/backgammon/review", json={
+        "turns": turns, "move_level": "1ply", "cube_level": "2ply"})
+    assert r.status_code == 200, r.text
+    reported = r.json()["turns"][1]["luck"]["luck"]
+
+    cube = bgsage.create_analyzer("2ply")
+
+    def luck_on(cube_value, cube_owner):
+        analysis = cube.cube_action(list(CUBE_SENSITIVE), incl_2ply_details=True,
+                                    cube_value=cube_value, cube_owner=cube_owner)
+        return bgsage.roll_luck(analysis, 2, 5, is_opening_roll=False).luck
+
+    post, pre = luck_on(2, "opponent"), luck_on(1, "centered")
+    assert reported == pytest.approx(post, abs=1e-9)
+    assert reported != pytest.approx(pre, abs=1e-3)   # the cube really moves it
+    assert (round(pre, 4), round(post, 4)) == (-0.1006, -0.0794)
+
+
 def test_all_results_is_off_by_default():
     turns = self_play(6, max_turns=2)
     r = client.post("/backgammon/review", json={
@@ -357,3 +421,26 @@ def test_a_roll_that_moves_nothing_lists_nothing_extra():
     assert move["n_legal"] == len(move.get("results", []))
     assert move.get("danced") or (move["forced"] and move["played"]["board"] == danced)
     assert r.json()["players"][0]["moves"]["decisions"] == 0    # nothing to decide
+
+
+def test_a_danced_turn_carries_an_empty_results_list(monkeypatch):
+    # bgsage 2.0.20260907 answers a real dance with the unchanged board rather
+    # than an empty list, so the `danced` branch is reached by making
+    # possible_moves say what its own docstring promises. The point is the
+    # shape of the reply: every move carries `results` when it was asked for,
+    # a dance included, so a caller never has to tell absent from empty.
+    monkeypatch.setattr(bgsage, "possible_moves", lambda *a, **k: [])
+    board = list(START)
+    turns = [{"player": 0, "board": board, "dice": [6, 5], "played": board}]
+    body = review_game(
+        ReviewRequest.model_validate({"turns": turns, "move_level": "1ply",
+                                      "cube_level": "1ply", "all_results": True}),
+        analyze_serially(analyzer))
+    assert body["turns"][0]["move"] == {"danced": True, "n_legal": 0, "results": []}
+
+    # Without the flag the key is absent, exactly as before.
+    body = review_game(
+        ReviewRequest.model_validate({"turns": turns, "move_level": "1ply",
+                                      "cube_level": "1ply"}),
+        analyze_serially(analyzer))
+    assert body["turns"][0]["move"] == {"danced": True, "n_legal": 0}

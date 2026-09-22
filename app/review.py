@@ -262,20 +262,28 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
     match = dict(cube_value=turn.cube_value, cube_owner=turn.cube_owner,
                  away1=turn.away1, away2=turn.away2,
                  is_crawford=turn.is_crawford, jacoby=req.jacoby)
+    # The cube everything after the double is played and judged on. It is the
+    # turn's own cube unless a double was taken, and then it is twice that,
+    # owned by the taker.
+    cube_value, cube_owner = play_cube(turn)
+    play = {**match, "cube_value": cube_value, "cube_owner": cube_owner}
+    post_take = play != match
     out: dict = {"index": index, "player": turn.player, "dice": turn.dice,
                  "cube": None, "move": None, "luck": None}
 
     lucky = luck_level(req.cube_level) if req.include_luck and turn.dice is not None else None
     cube_analysis = luck_analysis = None
     if can_double(turn):
-        shared = lucky == req.cube_level
+        # A post-take turn rolls on a cube the graded analysis knows nothing
+        # about, so luck cannot ride along on it: it gets its own analysis.
+        shared = lucky == req.cube_level and not post_take
         cube_analysis = analyzer(req.cube_level).cube_action(
             turn.board, incl_2ply_details=shared, **match)
         out["cube"] = review_cube(turn, cube_analysis)
         if shared:
             luck_analysis = cube_analysis
     if lucky and luck_analysis is None:
-        luck_analysis = analyzer(lucky).cube_action(turn.board, incl_2ply_details=True, **match)
+        luck_analysis = analyzer(lucky).cube_action(turn.board, incl_2ply_details=True, **play)
 
     if turn.dice is not None:
         d1, d2 = turn.dice
@@ -286,14 +294,15 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
                                "average_equity": luck.average_equity,
                                "level_label": luck.level_label}
         if not bgsage.possible_moves(turn.board, d1, d2):
+            # Nothing was evaluated, so `results` (when asked for) is empty
+            # rather than missing: every move carries it or none does.
             out["move"] = {"danced": True, "n_legal": 0}
+            if req.all_results:
+                out["move"]["results"] = []
         else:
             # The checker play happens after any double was answered, so it is
             # made on the cube the take left behind, not the pre-offer one.
-            cube_value, cube_owner = play_cube(turn)
-            result = analyzer(req.move_level).checker_play(
-                turn.board, d1, d2, **{**match, "cube_value": cube_value,
-                                       "cube_owner": cube_owner})
+            result = analyzer(req.move_level).checker_play(turn.board, d1, d2, **play)
             try:
                 out["move"] = review_move(turn, result, req.top_moves, req.all_results)
             except ValueError as e:
