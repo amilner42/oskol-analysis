@@ -156,3 +156,141 @@ def test_levels_are_echoed_and_checked():
     assert r.json()["levels"] == {"move": "1ply", "cube": "1ply", "luck": None}
     r = client.post("/backgammon/review", json={"turns": turns, "move_level": "9ply"})
     assert r.status_code == 422
+
+
+class Spy:
+    """A fake engine factory that records what each call was asked to evaluate.
+
+    Answers from a 1-ply engine so the numbers are real but cheap; the point
+    of the tests below is the cube context each call was given.
+    """
+
+    def __init__(self):
+        self.cube_calls, self.play_calls = [], []
+        self.engine = bgsage.create_analyzer("1ply")
+
+    def __call__(self, level):
+        outer = self
+
+        class Engine:
+            def cube_action(self, board, incl_2ply_details=False, **kw):
+                outer.cube_calls.append(kw)
+                engine = analyzer("2ply") if incl_2ply_details else outer.engine
+                return engine.cube_action(board, incl_2ply_details=incl_2ply_details, **kw)
+
+            def checker_play(self, board, d1, d2, **kw):
+                outer.play_calls.append(kw)
+                return outer.engine.checker_play(board, d1, d2, **kw)
+
+        return Engine()
+
+
+def cube_context(call: dict) -> tuple[int, str]:
+    return call["cube_value"], call["cube_owner"]
+
+
+def spy_on(turns: list[dict], **overrides) -> Spy:
+    """Review these turns at 1-ply with no luck, and keep the calls made."""
+    spy = Spy()
+    req = ReviewRequest.model_validate(
+        {"turns": turns, "move_level": "1ply", "cube_level": "1ply",
+         "include_luck": False, **overrides})
+    spy.body = review_game(req, analyze_serially(spy))
+    return spy
+
+
+def doubled_turn(player: int = 0, response: str = "take", **fields) -> dict:
+    """A turn that opens with a double: the mover doubles, then rolls 3-1."""
+    turn = {"player": player, "board": list(START), "doubled": True, "response": response}
+    if response == "take":
+        turn |= {"dice": [3, 1],
+                 "played": bgsage.create_analyzer("1ply").checker_play(START, 3, 1).moves[0].board}
+    return turn | fields
+
+
+def test_checker_play_after_a_take_is_on_the_doubled_cube():
+    # The cube decision is the one the doubler faced: centered, worth 1. The
+    # move that follows is played on a 2-cube the taker owns.
+    spy = spy_on([doubled_turn()])
+    assert [cube_context(c) for c in spy.cube_calls] == [(1, "centered")]
+    assert [cube_context(c) for c in spy.play_calls] == [(2, "opponent")]
+
+
+def test_a_redouble_taken_hands_the_doubled_cube_back():
+    # The mover already owned a 2-cube, redoubled to 4 and was taken: from
+    # here the 4-cube is the opponent's.
+    spy = spy_on([doubled_turn(cube_value=2, cube_owner="player")])
+    assert [cube_context(c) for c in spy.cube_calls] == [(2, "player")]
+    assert [cube_context(c) for c in spy.play_calls] == [(4, "opponent")]
+
+
+def test_both_orientations_see_the_same_post_take_cube():
+    # Boards and cube owner are always relative to the player on roll, so who
+    # is doubling (player 0 or 1) changes nothing about the context.
+    for player in (0, 1):
+        spy = spy_on([doubled_turn(player=player)])
+        assert [cube_context(c) for c in spy.play_calls] == [(2, "opponent")]
+        assert spy.body["turns"][0]["player"] == player
+
+
+def test_a_take_at_a_match_score_keeps_the_score_and_doubles_the_cube():
+    spy = spy_on([doubled_turn(away1=5, away2=3)])
+    cube, play = spy.cube_calls[0], spy.play_calls[0]
+    assert cube_context(cube) == (1, "centered") and cube_context(play) == (2, "opponent")
+    for call in (cube, play):
+        assert (call["away1"], call["away2"], call["is_crawford"]) == (5, 3, False)
+
+
+def test_jacoby_is_passed_through_to_the_post_take_play():
+    # Jacoby is the caller's money-game rule and it travels unchanged; bgsage
+    # itself only applies it to a centered cube, so the post-take evaluation
+    # is the same either way. Asserting both keeps that from silently drifting.
+    for jacoby in (True, False):
+        spy = spy_on([doubled_turn()], jacoby=jacoby)
+        assert cube_context(spy.play_calls[0]) == (2, "opponent")
+        assert spy.cube_calls[0]["jacoby"] is jacoby
+        assert spy.play_calls[0]["jacoby"] is jacoby
+    engine = bgsage.create_analyzer("1ply")
+    on, off = (engine.checker_play(START, 3, 1, cube_value=2, cube_owner="opponent",
+                                   jacoby=j).moves for j in (True, False))
+    assert [(m.board, m.equity) for m in on] == [(m.board, m.equity) for m in off]
+
+
+def test_no_double_and_a_passed_double_leave_the_cube_where_it_was():
+    plain = self_play(5, max_turns=1)
+    plain[0] |= {"cube_value": 2, "cube_owner": "player"}
+    spy = spy_on(plain)
+    assert cube_context(spy.cube_calls[0]) == (2, "player")
+    assert cube_context(spy.play_calls[0]) == (2, "player")
+
+    # A passed double ends the turn: a cube decision, and no checker play.
+    spy = spy_on([doubled_turn(response="pass")])
+    assert [cube_context(c) for c in spy.cube_calls] == [(1, "centered")]
+    assert spy.play_calls == []
+    assert spy.body["turns"][0]["move"] is None
+    assert spy.body["turns"][0]["cube"]["response"] == "pass"
+
+
+# A position where the cube actually changes the best play: on a centered
+# 1-cube and on the 2-cube a taker owns, 1-ply picks different moves.
+CUBE_SENSITIVE = [0, 2, 0, 0, 1, 2, 2, -2, 2, 2, 0, 0, -3, 2, 1, 0, 1, -2, 0, -4, 0, 0, -2, -2, 0, 0]
+
+
+def test_a_taken_double_is_graded_like_an_independent_post_take_request():
+    engine = bgsage.create_analyzer("1ply")
+    post = engine.checker_play(list(CUBE_SENSITIVE), 2, 5, cube_value=2, cube_owner="opponent")
+    pre = engine.checker_play(list(CUBE_SENSITIVE), 2, 5, cube_value=1, cube_owner="centered")
+    assert post.moves[0].board != pre.moves[0].board, "position must be cube-sensitive"
+
+    turns = [{"player": 0, "board": CUBE_SENSITIVE, "doubled": True, "response": "take",
+              "dice": [2, 5], "played": post.moves[0].board}]
+    r = client.post("/backgammon/review", json={
+        "turns": turns, "move_level": "1ply", "cube_level": "1ply", "include_luck": False})
+    assert r.status_code == 200, r.text
+    move = r.json()["turns"][0]["move"]
+    assert move["best"]["board"] == post.moves[0].board
+    assert move["best"]["equity"] == post.moves[0].equity
+    assert move["grade"] == "best" and move["error"] == 0.0     # it played the best
+    assert move["n_legal"] == len(post.moves)
+    # The pre-offer cube would have called the same play a mistake.
+    assert [m.board for m in pre.moves].index(post.moves[0].board) > 0
