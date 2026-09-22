@@ -84,6 +84,10 @@ class ReviewRequest(BaseModel):
     cube_level: Level = REVIEW_CUBE_LEVEL
     top_moves: int = Field(default=5, ge=1, le=50)
     include_luck: bool = True
+    # Every legal play's board and equity loss, not just the top few. Compact
+    # (no notation, no probabilities) so a whole game stays small enough to
+    # store: a caller that must grade any legal answer needs them all.
+    all_results: bool = False
 
 
 def can_double(turn: Turn) -> bool:
@@ -92,6 +96,20 @@ def can_double(turn: Turn) -> bool:
     money = turn.away1 == 0 and turn.away2 == 0
     # A cube that already covers what the doubler needs is dead.
     return money or turn.cube_value < turn.away1
+
+
+def play_cube(turn: Turn) -> tuple[int, str]:
+    """The cube the checker play of this turn is made on: its value and owner.
+
+    A double that was taken turns the cube before the mover rolls: it is worth
+    twice as much and it belongs to the taker, who from the mover's side is
+    the opponent. The cube *decision* is still graded on the pre-offer cube --
+    that is what the doubler was looking at -- and only what follows the take
+    moves on. No double, or a double that was passed, leaves the cube alone.
+    """
+    if turn.doubled and turn.response == "take":
+        return turn.cube_value * 2, "opponent"
+    return turn.cube_value, turn.cube_owner
 
 
 def review_cube(turn: Turn, analysis: bgsage.CubeActionResult) -> dict:
@@ -144,7 +162,8 @@ def move_entry(turn: Turn, m: bgsage.MoveAnalysis, rank: int) -> dict:
     }
 
 
-def review_move(turn: Turn, result: bgsage.CheckerPlayResult, top_n: int) -> dict:
+def review_move(turn: Turn, result: bgsage.CheckerPlayResult, top_n: int,
+                all_results: bool = False) -> dict:
     """The move made against every legal one. Raises ValueError if it is not legal."""
     moves = result.moves
     played_rank = next((i for i, m in enumerate(moves) if m.board == turn.played), None)
@@ -157,7 +176,7 @@ def review_move(turn: Turn, result: bgsage.CheckerPlayResult, top_n: int) -> dic
     top = [move_entry(turn, m, i + 1) for i, m in enumerate(moves[:top_n])]
     if played_rank >= top_n:
         top.append(move_entry(turn, played, played_rank + 1))
-    return {
+    out = {
         "played": move_entry(turn, played, played_rank + 1),
         "best": move_entry(turn, moves[0], 1),
         "top": top,
@@ -167,6 +186,12 @@ def review_move(turn: Turn, result: bgsage.CheckerPlayResult, top_n: int) -> dic
         "grade": "best" if error == 0.0 else grade(error),   # a tie lost nothing
         "eval_level": result.eval_level,
     }
+    if all_results:
+        # Every legal play, in rank order, board and equity loss only: the
+        # engine evaluated them all anyway, and a caller grading an answer
+        # that did not make the top few needs its number from stored data.
+        out["results"] = [{"board": m.board, "equity_diff": m.equity_diff} for m in moves]
+    return out
 
 
 def new_totals() -> dict:
@@ -231,23 +256,34 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
     Depends on nothing but the turn and the request, so turns can be analysed
     in any order, on any process, and still come out the same.
     """
+    # The cube as the turn opened, before any double was offered: what the
+    # cube decision (and the luck that shares its analysis) is judged on. The
+    # checker play below moves on to what a take left (play_cube).
     match = dict(cube_value=turn.cube_value, cube_owner=turn.cube_owner,
                  away1=turn.away1, away2=turn.away2,
                  is_crawford=turn.is_crawford, jacoby=req.jacoby)
+    # The cube everything after the double is played and judged on. It is the
+    # turn's own cube unless a double was taken, and then it is twice that,
+    # owned by the taker.
+    cube_value, cube_owner = play_cube(turn)
+    play = {**match, "cube_value": cube_value, "cube_owner": cube_owner}
+    post_take = play != match
     out: dict = {"index": index, "player": turn.player, "dice": turn.dice,
                  "cube": None, "move": None, "luck": None}
 
     lucky = luck_level(req.cube_level) if req.include_luck and turn.dice is not None else None
     cube_analysis = luck_analysis = None
     if can_double(turn):
-        shared = lucky == req.cube_level
+        # A post-take turn rolls on a cube the graded analysis knows nothing
+        # about, so luck cannot ride along on it: it gets its own analysis.
+        shared = lucky == req.cube_level and not post_take
         cube_analysis = analyzer(req.cube_level).cube_action(
             turn.board, incl_2ply_details=shared, **match)
         out["cube"] = review_cube(turn, cube_analysis)
         if shared:
             luck_analysis = cube_analysis
     if lucky and luck_analysis is None:
-        luck_analysis = analyzer(lucky).cube_action(turn.board, incl_2ply_details=True, **match)
+        luck_analysis = analyzer(lucky).cube_action(turn.board, incl_2ply_details=True, **play)
 
     if turn.dice is not None:
         d1, d2 = turn.dice
@@ -258,11 +294,17 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
                                "average_equity": luck.average_equity,
                                "level_label": luck.level_label}
         if not bgsage.possible_moves(turn.board, d1, d2):
+            # Nothing was evaluated, so `results` (when asked for) is empty
+            # rather than missing: every move carries it or none does.
             out["move"] = {"danced": True, "n_legal": 0}
+            if req.all_results:
+                out["move"]["results"] = []
         else:
-            result = analyzer(req.move_level).checker_play(turn.board, d1, d2, **match)
+            # The checker play happens after any double was answered, so it is
+            # made on the cube the take left behind, not the pre-offer one.
+            result = analyzer(req.move_level).checker_play(turn.board, d1, d2, **play)
             try:
-                out["move"] = review_move(turn, result, req.top_moves)
+                out["move"] = review_move(turn, result, req.top_moves, req.all_results)
             except ValueError as e:
                 raise ValueError(f"turns[{index}]: {e}") from e
     return out

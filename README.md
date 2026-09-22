@@ -45,7 +45,7 @@ quick setting; `/review` defaults to `4ply` for both.
 | `POST /backgammon/moves` | `dice: [d1, d2]`, `include_game_plans` | every legal play best first: `board`, `equity`, `cubeless_equity`, `equity_diff`, `probs` |
 | `POST /backgammon/cube` | | `equity_nd`, `equity_dt`, `equity_dp`, `should_double`, `should_take`, `optimal_action`, `probs` |
 | `POST /backgammon/position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
-| `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `include_luck` | a whole game graded, see below |
+| `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `all_results`, `include_luck` | a whole game graded, see below |
 | `POST /backgammon/batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
 | `GET /health` | | `ok`, `model`, `levels`, `review_workers`, `engine_threads` |
 
@@ -61,7 +61,7 @@ default at 4-ply (what XG's own analysis reads as accurate):
 
 ```json
 {"jacoby": true, "move_level": "4ply", "cube_level": "4ply", "top_moves": 5,
- "include_luck": true,
+ "all_results": false, "include_luck": true,
  "turns": [
    {"player": 0, "board": [...], "cube_value": 1, "cube_owner": "centered",
     "away1": 0, "away2": 0, "is_crawford": false,
@@ -74,7 +74,17 @@ default at 4-ply (what XG's own analysis reads as accurate):
 still from the mover's view, or `null` when the roll could not be played.
 A turn that doubles carries `doubled: true` and the opponent's `response`
 (`take` or `pass`); a passed double has no dice and no move. Cube state and
-match score are per turn, so the caller does not need to track them here.
+match score are per turn, so the caller does not need to track them here,
+and they are the cube **as the turn opened**, before any double was offered.
+The cube decision is graded on that, because it is what the doubler was
+looking at. Everything that happens after a take — the checker play and the
+luck of the roll — is evaluated on the cube the take left behind: twice the
+value, owned by the taker, which is what the mover is really playing on. A
+taken double therefore needs its own luck analysis instead of sharing the
+graded one. At the review defaults (4-ply cube, 3-ply luck) luck already had
+its own, so that costs nothing; at a cube level of 2-ply or 3-ply, where one
+analysis used to serve both, it is one extra call on taken-double turns and
+on no others.
 
 Each turn comes back with:
 
@@ -89,6 +99,19 @@ Each turn comes back with:
   `board`), `top` (the top N, plus the played move if it ranked lower),
   `n_legal`, `forced`, `error` and `grade` (`best` or the bands above).
   A dance is `{"danced": true}`.
+  With `all_results: true` it also carries `results`: every legal play,
+  best first, as `{board, equity_diff}` and nothing else — the same board
+  encoding and the same best-relative `equity_diff` (0 for the best, negative
+  for the rest) the entries in `top` use. The engine evaluates every legal
+  move either way; `top_moves` only truncates the reply, so this costs
+  nothing but bytes, and it is what a caller needs to grade an answer that
+  did not make the top few. It is off by default: at 1-ply on self-played
+  games a typical turn (10 legal plays) grows from about 3.2 KB to 4.3 KB,
+  and the worst doubles turn measured (1-1, 357 legal plays) from 3.3 KB to
+  40 KB — roughly 105 bytes a play. A whole 63-turn game went from 181 KB to
+  323 KB. `top` is unchanged by the flag, and a dance carries
+  `"results": []` rather than no key at all, so absent always means the flag
+  was off.
 - `luck`: how lucky the roll was in equity, from the roller's view (needs a
   cube level of 2-ply or more). It reads the per-roll equities of a cube
   analysis at the cube level, but never deeper than 3-ply (so 2-ply luck,
@@ -114,6 +137,24 @@ default cores / workers, at least 2) tune it; `REVIEW_WORKERS=1` reviews
 serially in the server process. A 4-ply review is mostly the checker plays
 (about 6 CPU-seconds a turn on an M-series core, more on a busy midgame):
 a 70-turn game took 111 s locally with 4 workers.
+
+### Reviews stored before the post-take fix
+
+A review run before that fix analysed the whole turn on the pre-offer cube,
+so a stored response has the wrong numbers on its taken-double turns. They
+can be found in the stored response alone, without the engine:
+
+- **wrong luck**: `cube.action == "double"` and `cube.response == "take"` and
+  `luck` is present.
+- **wrong move analysis** (candidate equities, the ranking, `error`, `grade`
+  and that turn's share of the player's `pr`): the same two, plus a `move`
+  that is neither `danced` nor `forced` — a forced move and a roll that
+  plays nothing had nothing to decide, so their numbers change nothing that
+  is counted.
+
+Everything else in such a game — every other turn, and that turn's own cube
+verdict — is unaffected. Re-rendering a stored response cannot repair it:
+the numbers came from the wrong position, so it takes a fresh review.
 
 ## Run locally
 
