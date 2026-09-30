@@ -444,3 +444,48 @@ def test_a_danced_turn_carries_an_empty_results_list(monkeypatch):
                                       "cube_level": "1ply"}),
         analyze_serially(analyzer))
     assert body["turns"][0]["move"] == {"danced": True, "n_legal": 0}
+
+
+def test_a_turn_reviewed_alone_matches_its_place_in_the_whole_game():
+    """One turn at a time is the same answer as the whole game in one request.
+
+    This is what lets a caller grade turns as they are played and assemble the
+    review at the end. Only luck knows where a turn sits, so `index` is the
+    whole of what a lone turn needs to be told.
+    """
+    turns = self_play(11, max_turns=6)
+    whole = ReviewRequest.model_validate(
+        {"turns": turns, "move_level": "1ply", "cube_level": "2ply"})
+    graded = review_game(whole, analyze_serially(analyzer))["turns"]
+
+    for index, turn in enumerate(turns):
+        alone = ReviewRequest.model_validate(
+            {"turns": [{**turn, "index": index}],
+             "move_level": "1ply", "cube_level": "2ply"})
+        one = review_game(alone, analyze_serially(analyzer))
+        assert one["turns"] == [graded[index]]
+        # The totals of a one-turn review are that turn's alone; a caller
+        # assembling a game adds them up itself.
+        assert one["players"][turn["player"]]["luck"] == pytest.approx(
+            graded[index]["luck"]["luck"] if graded[index]["luck"] else 0.0)
+
+
+def test_without_an_index_a_lone_turn_reads_as_the_opening_roll():
+    """Why `index` exists: its fallback is the turn's place in the request."""
+    args = {"move_level": "1ply", "cube_level": "2ply"}
+    # Doubles cannot be an opening roll, so pick a turn that could be one.
+    turn = next(t for t in self_play(11, max_turns=6) if t["dice"][0] != t["dice"][1])
+
+    def graded(**extra):
+        req = ReviewRequest.model_validate({"turns": [{**turn, **extra}], **args})
+        return review_game(req, analyze_serially(analyzer))["turns"][0]
+
+    placed, alone = graded(index=1), graded()
+    assert (placed["index"], alone["index"]) == (1, 0)
+    # Nothing but the luck of the roll depends on where the turn sits.
+    for key in ("player", "dice", "cube", "move"):
+        assert placed[key] == alone[key]
+    # The opening roll's average equity is taken over the thirty unequal
+    # pairs, not over every roll, so the same dice are worth different luck.
+    assert placed["luck"] is not None and alone["luck"] is not None
+    assert placed["luck"] != alone["luck"]

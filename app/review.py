@@ -52,6 +52,13 @@ def grade(error: float) -> str:
 class Turn(BaseModel):
     player: Literal[0, 1]
     board: list[int] = Field(min_length=26, max_length=26)
+    # Where this turn sits in its own game, when the request is not the whole
+    # game in order. Luck on the opening roll is measured differently (both
+    # dice are thrown, and they cannot pair), so a turn sent on its own has
+    # to say whether it is the opening one or the request would grade every
+    # single-turn review as an opening roll. Left out, it is the turn's
+    # position in this request, which is what a whole-game review wants.
+    index: int | None = Field(default=None, ge=0)
     cube_value: int = 1
     cube_owner: Literal["centered", "player", "opponent"] = "centered"
     away1: int = 0
@@ -255,7 +262,15 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
 
     Depends on nothing but the turn and the request, so turns can be analysed
     in any order, on any process, and still come out the same.
+
+    `index` is this turn's place in the request; `turn.index` overrides it with
+    its place in the game it came from, for a caller sending turns one at a
+    time. Only luck reads it (the opening roll), and the reply echoes it, so a
+    turn reviewed alone comes back exactly as the same turn in a whole-game
+    review. The positional index stays in the error messages, which are about
+    the request the caller sent.
     """
+    place = index if turn.index is None else turn.index
     # The cube as the turn opened, before any double was offered: what the
     # cube decision (and the luck that shares its analysis) is judged on. The
     # checker play below moves on to what a take left (play_cube).
@@ -268,7 +283,7 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
     cube_value, cube_owner = play_cube(turn)
     play = {**match, "cube_value": cube_value, "cube_owner": cube_owner}
     post_take = play != match
-    out: dict = {"index": index, "player": turn.player, "dice": turn.dice,
+    out: dict = {"index": place, "player": turn.player, "dice": turn.dice,
                  "cube": None, "move": None, "luck": None}
 
     lucky = luck_level(req.cube_level) if req.include_luck and turn.dice is not None else None
@@ -288,7 +303,7 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
     if turn.dice is not None:
         d1, d2 = turn.dice
         if luck_analysis is not None:
-            luck = bgsage.roll_luck(luck_analysis, d1, d2, is_opening_roll=index == 0)
+            luck = bgsage.roll_luck(luck_analysis, d1, d2, is_opening_roll=place == 0)
             if luck is not None:
                 out["luck"] = {"luck": luck.luck, "actual_equity": luck.actual_equity,
                                "average_equity": luck.average_equity,
