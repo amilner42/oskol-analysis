@@ -66,18 +66,69 @@ def upstream():
 
 @pytest.fixture
 def forwarding(upstream, monkeypatch):
+    """Phase 1: the desktop does the work."""
     _, url = upstream
     monkeypatch.setenv("UPSTREAM_URL", url)
+    monkeypatch.setenv("UPSTREAM_FORWARD", "1")
     monkeypatch.delenv("UPSTREAM_PROXY", raising=False)
     return TestClient(app)
+
+
+@pytest.fixture
+def probing(upstream, monkeypatch):
+    """Phase 0: we know where the desktop is and ask after it, but every route
+    is still answered here. This is the state production sits in while the
+    tailnet is being proved, so it is the one that must not break anything."""
+    _, url = upstream
+    monkeypatch.setenv("UPSTREAM_URL", url)
+    monkeypatch.delenv("UPSTREAM_FORWARD", raising=False)
+    monkeypatch.delenv("UPSTREAM_PROXY", raising=False)
+    return TestClient(app)
+
+
+def test_probing_does_not_move_the_work(probing):
+    """The whole point of two switches: a URL alone must not route a review."""
+    body = probing.get("/health").json()
+    assert body["engine"] == "bgsage"          # answered here
+    assert body["upstream"]["reached"] is True
+    assert body["upstream"]["forwarding"] is False
+    # /health asked the desktop; nothing else went near it.
+    assert [s["path"] for s in _Upstream.seen] == ["/health"]
+
+
+def test_probing_reports_a_desktop_that_is_away(monkeypatch):
+    """Phase 0's only job: say so, and say it as a 503, while the engine here
+    keeps answering reviews exactly as before."""
+    monkeypatch.setenv("UPSTREAM_URL", "http://127.0.0.1:9")  # discard
+    monkeypatch.delenv("UPSTREAM_FORWARD", raising=False)
+    monkeypatch.delenv("UPSTREAM_PROXY", raising=False)
+    monkeypatch.setenv("UPSTREAM_CONNECT_TIMEOUT_S", "2")
+
+    import importlib
+
+    from app import forward
+
+    importlib.reload(forward)
+    try:
+        answer = TestClient(app).get("/health")
+        assert answer.status_code == 503
+        body = answer.json()
+        assert body["ok"] is False
+        assert body["upstream"]["reached"] is False
+        assert body["engine"] == "bgsage"      # still the engine that is here
+    finally:
+        monkeypatch.delenv("UPSTREAM_CONNECT_TIMEOUT_S", raising=False)
+        importlib.reload(forward)
 
 
 def test_unset_is_the_app_it_always_was(monkeypatch):
     """No UPSTREAM_URL, no forwarding: /health is answered here, by the engine."""
     monkeypatch.delenv("UPSTREAM_URL", raising=False)
+    monkeypatch.delenv("UPSTREAM_FORWARD", raising=False)
     body = TestClient(app).get("/health").json()
     assert body["engine"] == "bgsage"
     assert "review_workers" in body
+    assert "upstream" not in body
 
 
 def test_health_is_forwarded(forwarding, upstream):

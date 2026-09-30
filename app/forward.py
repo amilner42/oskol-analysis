@@ -1,15 +1,27 @@
 """Answering with a machine that is not this one.
 
-Set ``UPSTREAM_URL`` and this process stops computing: every request is
-passed through to that address and its answer returned verbatim, status and
-body unchanged. Unset it and nothing here runs at all — the app is exactly
-what it was.
+Two switches, because there are two decisions and collapsing them costs a
+production outage.
 
-That switch is the point. The engine is moving onto a desktop reached over a
-tailnet (Aveline ticket ``bg-analysis-imac``), and the way back from that is
-``fly secrets unset UPSTREAM_URL`` and a bigger machine, not a different
-deploy of different code. One environment variable is cheaper to reason
-about at 2am than two images.
+``UPSTREAM_URL`` says where the desktop is. On its own it changes nothing
+about who computes: every route still answers here, exactly as it always
+has. What it adds is that ``/health`` now also *asks* the desktop, and says
+so — 503 when it cannot be reached. That is the whole of phase 0. Oskol's
+status page tells the truth about a tailnet the analysis does not yet depend
+on, which is the only order in which finding out it is flaky is cheap.
+
+``UPSTREAM_FORWARD`` moves the work. With it set, this process computes
+nothing: every request is passed through and its answer returned verbatim,
+status and body unchanged.
+
+Both are secrets rather than code, because the way back from a desktop that
+is asleep at 2am should be ``fly secrets unset UPSTREAM_FORWARD`` — and, if
+it stays away, ``unset UPSTREAM_URL`` and a bigger machine. An environment
+variable is cheaper to reason about at 2am than a second image, and going
+back one step is cheaper than going back both.
+
+The engine is moving onto Arie's desktop; the Aveline ticket is
+``bg-analysis-imac``.
 
 Two things are deliberately not forwarded:
 
@@ -18,7 +30,8 @@ own health check reads it. If the platform's check went through to the
 desktop, a desktop that is asleep would read as a sick machine and Fly would
 restart this one in a loop over a condition restarting cannot fix.
 
-``/health`` *is* forwarded, which is the other half of the same thought.
+``/health`` *is* forwarded once the work moves, which is the other half of
+the same thought.
 Oskol's status page reads it to answer "is analysis working", and the honest
 answer to that is the desktop's, not ours. A proxy that reports its own
 health while the thing behind it is dead is worse than no status page.
@@ -57,8 +70,28 @@ _DROP = {
 
 
 def upstream() -> str | None:
-    """The address to answer with, or None to answer here."""
+    """Where the desktop is, or None if we have not been told."""
     return (os.environ.get("UPSTREAM_URL") or "").rstrip("/") or None
+
+
+def forwarding() -> bool:
+    """Whether the desktop does the work, or we only ask after its health."""
+    return (os.environ.get("UPSTREAM_FORWARD") or "").lower() in {"1", "true", "yes", "on"}
+
+
+async def probe(to: str) -> tuple[bool, str]:
+    """Ask the desktop's /health and say how it went, without routing anything
+    through it. This is what lets a status page be honest in phase 0."""
+    try:
+        async with _client() as client:
+            answer = await client.get(
+                f"{to}/health", timeout=httpx.Timeout(10, connect=CONNECT_TIMEOUT_S)
+            )
+    except httpx.HTTPError as e:
+        return False, f"{type(e).__name__}: {e}"
+    if answer.status_code != 200:
+        return False, f"HTTP {answer.status_code}"
+    return True, "ok"
 
 
 def _proxy() -> str | None:
