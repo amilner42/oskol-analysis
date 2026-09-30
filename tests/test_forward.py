@@ -33,8 +33,11 @@ class _Upstream(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
         _Upstream.seen.append(
+            # Header names are case-insensitive on the wire and BaseHTTPRequestHandler
+            # keeps whatever case the sender used, so normalise once here rather
+            # than making every assertion guess.
             {"path": self.path, "method": self.command, "body": body,
-             "headers": dict(self.headers)}
+             "headers": {k.lower(): v for k, v in self.headers.items()}}
         )
         out = json.dumps(_Upstream.payload).encode()
         self.send_response(_Upstream.status)
@@ -154,6 +157,8 @@ def test_hop_by_hop_headers_are_not_relayed(forwarding):
     """Host and the connection-scoped headers belong to one hop; passing them
     on is how a proxy confuses the next one."""
     forwarding.get("/health", headers={"connection": "keep-alive", "te": "trailers"})
-    sent = {k.lower() for k in _Upstream.seen[-1]["headers"]}
+    sent = _Upstream.seen[-1]["headers"]
     assert "te" not in sent
-    assert _Upstream.seen[-1]["headers"]["host"].startswith("127.0.0.1")
+    # Host is not relayed but rebuilt for the hop actually being made, which is
+    # what stops the next server seeing a name meant for this one.
+    assert sent["host"].startswith("127.0.0.1")
