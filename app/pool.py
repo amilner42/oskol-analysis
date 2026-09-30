@@ -8,10 +8,24 @@ and keeps them. Results come back in turn order, and every turn's analysis
 depends only on that turn (bgsage clears its cache after each evaluation), so
 a parallel review returns exactly what a serial one does.
 
+A review carrying ONE turn is the opposite shape, and the pool is the wrong
+answer to it: there is nothing to spread, so the turn lands on a single worker
+holding one twentieth of the machine while the other nineteen sit idle. On the
+production i9 one 4-ply turn takes 11.7 s at one thread and 2.5 s at twenty,
+so such a request skips the pool entirely and runs in the server process on an
+engine given SOLO_ENGINE_THREADS (app.main.solo_analyzer). Both callers that
+send lone turns -- Oskol grading a turn while the game is still going, and the
+bot reviewing every move -- are waiting on the answer. The many-turn review is
+untouched: those workers are already saturated and widening them would only
+oversubscribe.
+
 Knobs (env):
   REVIEW_WORKERS         worker processes (default: the machine's cores)
   REVIEW_ENGINE_THREADS  bgsage threads per worker for a multi-ply evaluation
                          (default: cores / workers; bgsage uses at least 2)
+  SOLO_ENGINE_THREADS    bgsage threads for work that arrives on its own and is
+                         run in the server process rather than in the pool
+                         (default: the machine's cores)
 """
 
 from __future__ import annotations
@@ -35,6 +49,18 @@ def workers() -> int:
 
 def engine_threads() -> int:
     return max(1, int(os.getenv("REVIEW_ENGINE_THREADS", CORES // workers() or 1)))
+
+
+def solo_threads() -> int:
+    """Threads for an evaluation that has the server process to itself.
+
+    All of them: nothing else is queued behind it, and bgsage's threads split
+    one evaluation, which is exactly what a lone request is. Past the physical
+    cores the returns stop (the i9's 2.5 s at twenty threads is ten cores'
+    worth of work), but asking for the logical count costs nothing and saves
+    the machine having to be told how it is built.
+    """
+    return max(1, int(os.getenv("SOLO_ENGINE_THREADS", CORES)))
 
 
 # --- in the worker processes -------------------------------------------------

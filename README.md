@@ -47,7 +47,7 @@ quick setting; `/review` defaults to `4ply` for both.
 | `POST /backgammon/position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
 | `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `all_results`, `include_luck` | a whole game graded, see below |
 | `POST /backgammon/batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
-| `GET /health` | | `ok`, `model`, `levels`, `review_workers`, `engine_threads` |
+| `GET /health` | | `ok`, `model`, `levels`, `review_workers`, `engine_threads`, `solo_engine_threads` |
 
 Probabilities are `win`, `gammon_win`, `backgammon_win`, `gammon_loss`,
 `backgammon_loss`, from the on-roll player's view (for `/position`, the
@@ -145,6 +145,35 @@ default cores / workers, at least 2) tune it; `REVIEW_WORKERS=1` reviews
 serially in the server process. A 4-ply review is mostly the checker plays
 (about 6 CPU-seconds a turn on an M-series core, more on a busy midgame):
 a 70-turn game took 111 s locally with 4 workers.
+
+### A review of one turn
+
+A request carrying a single turn does not go to the pool at all. There is
+nothing to spread, so it would land on one worker holding one twentieth of
+the machine while the rest idled: on the production i9 (10 cores / 20
+threads) one 4-ply turn is 11.7 s at one thread and 2.5 s at twenty. It is
+analysed in the server process instead, on an engine created with
+`SOLO_ENGINE_THREADS` (default: the cores) — which is also why such a
+request never starts a pool it has no work for. The two callers that send
+lone turns, per-turn grading and the bot, are both waiting on the reply.
+The thread count does not change the answer — a turn reviewed alone is
+still exactly the same turn as in a whole-game review, which the tests
+pin — and a many-turn review is untouched, because its workers already
+have the machine between them.
+
+The single-position routes (`/moves`, `/cube`, `/position`, and a `/batch`
+of one item) take the same engine, for the same reason: one request, one
+position, nothing else to spend a core on. A `/batch` of several keeps
+bgsage's default thread count, since its items already run concurrently
+over `BATCH_WORKERS` threads and wide engines there would only fight for
+the same cores. Two lone requests overlapping do the same, and that is
+accepted: this server answers a handful of latency-sensitive callers, and
+half a wide engine still beats a single thread by a long way.
+
+`/health` reports `solo_engine_threads` beside `review_workers` and
+`engine_threads`, so it is visible which path a machine is on. The cost is
+memory: the wide engine is a resident engine per level in the server
+process, roughly one pool worker's worth (four workers peaked at ~2.2 GB).
 
 ### Reviews stored before the post-take fix
 

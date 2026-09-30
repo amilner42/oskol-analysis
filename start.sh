@@ -32,7 +32,9 @@ if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
     --accept-routes=false
 fi
 
-# One server worker: it answers the single-position routes from engines it
-# loads once. A review fans its turns out over a process pool of its own
-# (app/pool.py), one engine process per core. Forwarding, it loads neither.
+# One server worker: it answers the single-position routes, and any review
+# carrying a single turn, from engines it loads once -- those get the whole
+# machine, since there is nothing to share it with. A review of a whole game
+# fans its turns out over a process pool of its own (app/pool.py), one engine
+# process per core. Forwarding, it loads neither.
 exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1

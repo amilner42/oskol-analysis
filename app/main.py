@@ -22,7 +22,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict
-from typing import Literal
+from typing import Callable, Literal
 
 import bgsage
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
@@ -51,17 +51,42 @@ async def _upstream(request: Request, call_next):
 # Routes are namespaced by game; backgammon is the only one so far.
 backgammon = APIRouter(prefix="/backgammon", tags=["backgammon"])
 
-_analyzers: dict[str, bgsage.BgBotAnalyzer] = {}
+_analyzers: dict[tuple[str, int | None], bgsage.BgBotAnalyzer] = {}
 _lock = threading.Lock()
 _batch_pool = ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_WORKERS", "4")))
 
+# What a route hands the analysis code to get an engine for a level.
+Engines = Callable[[str], bgsage.BgBotAnalyzer]
 
-def analyzer(level: str) -> bgsage.BgBotAnalyzer:
-    """One engine per level, created on first use and shared by every request."""
+
+def analyzer(level: str, threads: int | None = None) -> bgsage.BgBotAnalyzer:
+    """One engine per level and thread count, created on first use and shared.
+
+    How many threads an engine splits an evaluation over is fixed when it is
+    created, so a wider engine is another entry here and never a change to an
+    existing one: whatever a caller already holds keeps the threads it was
+    made with. `threads=None` leaves the count to bgsage, as this has always
+    done. The engines are the resident memory of this process, so they are
+    made lazily and only in the combinations something actually asks for.
+    """
     with _lock:
-        if level not in _analyzers:
-            _analyzers[level] = bgsage.create_analyzer(level)
-        return _analyzers[level]
+        key = (level, threads)
+        if key not in _analyzers:
+            kwargs = {} if threads is None else {"parallel_threads": threads}
+            _analyzers[key] = bgsage.create_analyzer(level, **kwargs)
+        return _analyzers[key]
+
+
+def solo_analyzer(level: str) -> bgsage.BgBotAnalyzer:
+    """The engine for an evaluation that has this process to itself: all of it.
+
+    bgsage's own threads split one evaluation, which is the only thing a lone
+    request has. Two such requests overlapping do oversubscribe and slow each
+    other down, and that is the trade taken knowingly: this server answers a
+    few latency-sensitive callers rather than a crowd, and half a wide engine
+    still beats by a long way the one thread a pool worker would have had.
+    """
+    return analyzer(level, pool.solo_threads())
 
 
 class Position(BaseModel):
@@ -132,8 +157,8 @@ class BatchRequest(BaseModel):
     items: list[BatchItem] = Field(max_length=500)
 
 
-def _moves(req: MovesRequest) -> dict:
-    result = analyzer(req.level).checker_play(
+def _moves(req: MovesRequest, engines: Engines) -> dict:
+    result = engines(req.level).checker_play(
         req.board, req.dice[0], req.dice[1],
         include_game_plans=req.include_game_plans,
         **req.match_kwargs(),
@@ -141,12 +166,12 @@ def _moves(req: MovesRequest) -> dict:
     return asdict(result)
 
 
-def _cube(req: CubeRequest) -> dict:
-    return asdict(analyzer(req.level).cube_action(req.board, **req.match_kwargs()))
+def _cube(req: CubeRequest, engines: Engines) -> dict:
+    return asdict(engines(req.level).cube_action(req.board, **req.match_kwargs()))
 
 
-def _position(req: PositionRequest) -> dict:
-    return asdict(analyzer(req.level).post_move_analytics(req.board, **req.match_kwargs()))
+def _position(req: PositionRequest, engines: Engines) -> dict:
+    return asdict(engines(req.level).post_move_analytics(req.board, **req.match_kwargs()))
 
 
 @backgammon.post("/review")
@@ -155,8 +180,22 @@ def review(req: ReviewRequest) -> dict:
 
     Defaults to 4-ply moves and cubes, the turns spread over a process pool
     (app.pool). The response echoes the `levels` used and the `timing_ms`.
+
+    A review of a single turn has nothing to spread, so it is analysed here
+    instead, on an engine holding the whole machine -- see app.pool's header
+    for the measurements, and solo_analyzer above. Two callers send lone
+    turns and both are waiting on the reply. Running here also means such a
+    request never starts a pool it has no work for. The cut is at one turn
+    because one turn is what those callers send; where widening stops paying
+    (two turns? four?) has not been measured, so it is not guessed at here.
+
+    REVIEW_WORKERS=1 takes the same path for a whole game: the turns go one
+    at a time through this process, so there is nothing to share a core with
+    and no reason for that one turn at a time to be narrow either.
     """
-    analyze = pool.analyze_in_parallel if pool.workers() > 1 else analyze_serially(analyzer)
+    lone = len(req.turns) == 1
+    analyze = (pool.analyze_in_parallel if not lone and pool.workers() > 1
+               else analyze_serially(solo_analyzer))
     try:
         return review_game(req, analyze)
     except ValueError as e:
@@ -177,7 +216,8 @@ async def health(response: Response) -> dict:
     learning it is flaky is cheap.
     """
     body = {"ok": True, "engine": "bgsage", "model": bgsage.PRODUCTION_MODEL, "levels": LEVELS,
-            "review_workers": pool.workers(), "engine_threads": pool.engine_threads()}
+            "review_workers": pool.workers(), "engine_threads": pool.engine_threads(),
+            "solo_engine_threads": pool.solo_threads()}
 
     to = forward.upstream()
     if to is not None:
@@ -203,19 +243,19 @@ def health_self() -> dict:
 @backgammon.post("/moves")
 def moves(req: MovesRequest) -> dict:
     """Every legal play for the dice, best first, with equities and probabilities."""
-    return _moves(req)
+    return _moves(req, solo_analyzer)
 
 
 @backgammon.post("/cube")
 def cube(req: CubeRequest) -> dict:
     """The pre-roll cube decision: no double, double/take, double/pass equities."""
-    return _cube(req)
+    return _cube(req, solo_analyzer)
 
 
 @backgammon.post("/position")
 def position(req: PositionRequest) -> dict:
     """A post-move position, before the opponent rolls."""
-    return _position(req)
+    return _position(req, solo_analyzer)
 
 
 _KINDS = {
@@ -231,6 +271,11 @@ def batch(req: BatchRequest) -> dict:
 
     Items are validated up front so a bad one fails the whole batch with a
     422 before any engine time is spent.
+
+    A batch of one is a lone evaluation like any other and gets the machine.
+    Several already run concurrently over _batch_pool, so wide engines there
+    would fight each other for the same cores -- the pool's own argument --
+    and they keep bgsage's default thread count, as they always have.
     """
     jobs = []
     for i, item in enumerate(req.items):
@@ -240,7 +285,8 @@ def batch(req: BatchRequest) -> dict:
         except ValueError as e:
             raise HTTPException(422, detail=f"items[{i}]: {e}") from e
         jobs.append((run, parsed))
-    results = list(_batch_pool.map(lambda job: job[0](job[1]), jobs))
+    engines = solo_analyzer if len(jobs) == 1 else analyzer
+    results = list(_batch_pool.map(lambda job: job[0](job[1], engines), jobs))
     return {"results": results}
 
 

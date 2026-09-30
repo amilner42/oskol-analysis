@@ -1,6 +1,7 @@
 import bgsage
 from fastapi.testclient import TestClient
 
+from app import main, pool
 from app.main import app
 
 client = TestClient(app)
@@ -11,6 +12,32 @@ def test_health():
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+def test_health_says_which_threads_a_request_gets():
+    # An operator reading /health has to be able to tell a machine that gives
+    # a lone request everything from one that does not.
+    body = client.get("/health").json()
+    assert body["review_workers"] == pool.workers()
+    assert body["engine_threads"] == pool.engine_threads()
+    assert body["solo_engine_threads"] == pool.solo_threads()
+
+
+def test_solo_threads_is_the_whole_machine_and_still_a_knob(monkeypatch):
+    assert pool.solo_threads() == pool.CORES
+    monkeypatch.setenv("SOLO_ENGINE_THREADS", "3")
+    assert pool.solo_threads() == 3
+
+
+def test_a_wide_engine_is_a_second_engine_and_not_a_changed_one():
+    # An engine's thread count is fixed when it is created, so the wide one
+    # has to be its own cache entry: anything already holding the default
+    # engine keeps it, exactly as it was.
+    default = main.analyzer("1ply")
+    wide = main.solo_analyzer("1ply")
+    assert wide is not default
+    assert main.analyzer("1ply") is default
+    assert main.solo_analyzer("1ply") is wide
 
 
 def test_opening_31_plays_the_5_point():
