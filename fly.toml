@@ -30,9 +30,24 @@ kill_signal = 'SIGTERM'
 [http_service]
   internal_port = 8080
   force_https = false
-  auto_stop_machines = 'stop'
+  # Always one, and never stopped. Computing here, stopping when idle was
+  # free money: a review is minutes of work and nobody minds a few seconds of
+  # wake-up in front of it. Forwarding, it stops paying:
+  #
+  #   - tailscaled joins the tailnet at boot with an ephemeral key and keeps
+  #     its state in memory, so a machine that stops re-joins on every start.
+  #     That is a handshake in front of every review, and a window where the
+  #     upstream is unreachable for a reason that has nothing to do with the
+  #     upstream.
+  #   - Oskol's /status page reads /health through here. A stopped machine
+  #     reads as DOWN until Flycast wakes it, so a page whose whole job is to
+  #     say whether the desktop is answering would spend its time reporting on
+  #     this machine's sleep instead.
+  #
+  # A shared-cpu-1x that forwards costs little enough to leave running.
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
 
   [http_service.concurrency]
@@ -53,7 +68,9 @@ kill_signal = 'SIGTERM'
     path = '/health/self'
 
 # Forwarding, this machine does no engine work: it joins the tailnet, passes
-# a request through and passes the answer back. The eight dedicated cores
+# a request through and passes the answer back. 1gb rather than 512mb because
+# app/main.py imports bgsage whether or not it is going to use it, and
+# tailscaled sits beside it. The eight dedicated cores
 # were for 4-ply reviews, and those now run on a desktop that measured about
 # 2.3x faster than this machine for nothing (bg-analysis-imac).
 #
@@ -61,5 +78,5 @@ kill_signal = 'SIGTERM'
 # anything: shared CPUs throttle sustained work, which is exactly what a
 # review is. The size and the switch are two halves of one decision.
 [[vm]]
-  size = 'shared-cpu-2x'
-  memory = '2gb'
+  size = 'shared-cpu-1x'
+  memory = '1gb'
