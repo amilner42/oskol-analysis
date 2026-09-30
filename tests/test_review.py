@@ -106,6 +106,53 @@ def test_parallel_review_matches_serial():
     assert parallel == serial
 
 
+class PoolStarted(Exception):
+    """Raised in place of starting the process pool, to catch a request doing it."""
+
+
+def test_a_lone_turn_is_answered_here_and_a_game_still_goes_to_the_pool(monkeypatch):
+    # A request with one turn has nothing to spread, so it must not start a
+    # pool of one process per core to hold it -- the pool is lazy, and a bot
+    # sending a move at a time would otherwise pay for twenty engines it never
+    # uses. Two turns still go there, which is the other half of the rule.
+    def never() -> None:
+        raise PoolStarted()
+
+    monkeypatch.setattr(pool, "pool", never)
+    args = {"move_level": "1ply", "cube_level": "1ply"}
+    turns = self_play(11, max_turns=2)
+
+    r = client.post("/backgammon/review", json={"turns": turns[:1], **args})
+    assert r.status_code == 200, r.text
+
+    with pytest.raises(PoolStarted):
+        client.post("/backgammon/review", json={"turns": turns, **args})
+
+
+def test_a_lone_turn_through_the_api_matches_the_same_turn_in_a_whole_game():
+    """The whole safety claim of the lone-turn path, pinned end to end.
+
+    A one-turn review is analysed in the server process on an engine holding
+    the whole machine; a many-turn one goes to the pool, whose workers each
+    hold a fraction of it. bgsage's thread count does not move the numbers it
+    returns (measured at 1, 2, 4 and 20 threads on three real boards), so the
+    two paths must agree exactly -- were they ever to drift, a turn graded
+    while the game was going would disagree with the review of the game it is
+    part of, about the same move.
+    """
+    args = {"move_level": "1ply", "cube_level": "2ply"}
+    turns = self_play(11, max_turns=6)
+    whole = client.post("/backgammon/review", json={"turns": turns, **args})
+    assert whole.status_code == 200, whole.text
+    graded = whole.json()["turns"]
+
+    for index, turn in enumerate(turns):
+        alone = client.post("/backgammon/review",
+                            json={"turns": [{**turn, "index": index}], **args})
+        assert alone.status_code == 200, alone.text
+        assert alone.json()["turns"] == [graded[index]]
+
+
 def test_review_defaults_to_4ply():
     req = ReviewRequest.model_validate({"turns": self_play(1, max_turns=1)})
     assert (req.move_level, req.cube_level, req.top_moves) == ("4ply", "4ply", 5)
