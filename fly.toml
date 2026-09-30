@@ -14,6 +14,18 @@ kill_signal = 'SIGTERM'
 [env]
   PORT = '8080'
   BATCH_WORKERS = '4'
+  # Tailscale runs in userspace networking (no TUN on a Fly machine), so
+  # nothing reaches the tailnet through an ordinary socket. app/forward.py
+  # dials through tailscaled's own outbound proxy, which start.sh opens here.
+  UPSTREAM_PROXY = 'http://localhost:1055'
+
+# UPSTREAM_URL is deliberately NOT here. It is set as a secret
+# (fly secrets set UPSTREAM_URL=http://aries-imac:8080 -a oskol-analysis)
+# so that turning it off is a runtime act -- unset it, the machine restarts
+# computing locally -- rather than an edit, a commit, a CI run and a deploy.
+# The whole point of one switch is that it can be thrown at 2am.
+# Rolling back fully is: fly secrets unset UPSTREAM_URL, then
+# fly scale vm performance-8x --memory 16384.
 
 [http_service]
   internal_port = 8080
@@ -28,15 +40,26 @@ kill_signal = 'SIGTERM'
     hard_limit = 32
     soft_limit = 16
 
+  # /health/self, not /health: /health is forwarded when there is an upstream,
+  # and a platform check that reads a sleeping desktop would call this machine
+  # sick and restart it, over and over, for a condition restarting cannot fix.
+  # This check answers "is the container up"; Oskol's /status page answers "is
+  # analysis working", which is the question that wants the desktop.
   [[http_service.checks]]
     interval = '30s'
     timeout = '5s'
     grace_period = '20s'
     method = 'GET'
-    path = '/health'
+    path = '/health/self'
 
-# Dedicated cores: a review runs every decision at 4-ply across a process
-# pool sized to them (app.pool). Shared CPUs throttle sustained work.
+# Forwarding, this machine does no engine work: it joins the tailnet, passes
+# a request through and passes the answer back. The eight dedicated cores
+# were for 4-ply reviews, and those now run on a desktop that measured about
+# 2.3x faster than this machine for nothing (bg-analysis-imac).
+#
+# If UPSTREAM_URL is ever unset, this must go back up before it means
+# anything: shared CPUs throttle sustained work, which is exactly what a
+# review is. The size and the switch are two halves of one decision.
 [[vm]]
-  size = 'performance-8x'
-  memory = '16gb'
+  size = 'shared-cpu-2x'
+  memory = '2gb'

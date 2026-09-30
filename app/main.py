@@ -25,16 +25,29 @@ from dataclasses import asdict
 from typing import Literal
 
 import bgsage
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from app import pool
+from app import forward, pool
 from app.review import (CUBE_LEVEL, LEVELS, MOVE_LEVEL, Level, ReviewRequest,
                         analyze_serially, review_game)
 
 Owner = Literal["centered", "player", "opponent"]
 
 app = FastAPI(title="oskol-analysis", version="0.1.0")
+
+
+@app.middleware("http")
+async def _upstream(request: Request, call_next):
+    """Answer with the machine UPSTREAM_URL names, when it names one.
+
+    See app/forward.py. Unset, this costs one environment lookup a request
+    and changes nothing.
+    """
+    to = forward.upstream()
+    if to is None or request.url.path == "/health/self":
+        return await call_next(request)
+    return await forward.forward(request, to)
 # Routes are namespaced by game; backgammon is the only one so far.
 backgammon = APIRouter(prefix="/backgammon", tags=["backgammon"])
 
@@ -154,8 +167,18 @@ def review(req: ReviewRequest) -> dict:
 
 @app.get("/health")
 def health() -> dict:
+    """Is analysis working? Forwarded when there is an upstream, because the
+    answer anyone wants is the engine's, not the proxy's."""
     return {"ok": True, "engine": "bgsage", "model": bgsage.PRODUCTION_MODEL, "levels": LEVELS,
             "review_workers": pool.workers(), "engine_threads": pool.engine_threads()}
+
+
+@app.get("/health/self")
+def health_self() -> dict:
+    """Is *this* process up? Never forwarded, so Fly's platform check reads
+    this container and not a desktop that may be asleep — restarting this
+    machine cannot fix that, and a check that says otherwise loops."""
+    return {"ok": True, "upstream": forward.upstream()}
 
 
 @backgammon.post("/moves")
