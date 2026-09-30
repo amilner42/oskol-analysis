@@ -180,6 +180,7 @@ def test_an_unreachable_upstream_is_a_502(monkeypatch):
     one. It must be an answer: Oskol's queue stores a failure and its sweep
     retries, which it cannot do with a hang or a stack trace."""
     monkeypatch.setenv("UPSTREAM_URL", "http://127.0.0.1:9")  # discard
+    monkeypatch.setenv("UPSTREAM_FORWARD", "1")
     monkeypatch.delenv("UPSTREAM_PROXY", raising=False)
     monkeypatch.setenv("UPSTREAM_CONNECT_TIMEOUT_S", "2")
 
