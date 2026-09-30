@@ -72,6 +72,14 @@ default at 4-ply (what XG's own analysis reads as accurate):
 
 `player` is 0 or 1 (who is on roll), `played` is the board after the move,
 still from the mover's view, or `null` when the roll could not be played.
+A turn may also carry `index`, its place in the game it came from, counting
+from 0; without it a turn's index is its place in this request. Only luck
+reads it — the opening roll is thrown as two dice that cannot pair, so its
+average equity is taken over thirty rolls and not thirty-six — and the reply
+echoes it. A caller sending turns one at a time as they are played has to set
+it, or every single-turn review is graded as an opening roll; with it, a turn
+reviewed alone comes back exactly as the same turn in a whole-game review,
+which is what lets such a caller assemble the game's review from the parts.
 A turn that doubles carries `doubled: true` and the opponent's `response`
 (`take` or `pass`); a passed double has no dice and no move. Cube state and
 match score are per turn, so the caller does not need to track them here,
