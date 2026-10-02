@@ -95,6 +95,10 @@ class ReviewRequest(BaseModel):
     # (no notation, no probabilities) so a whole game stays small enough to
     # store: a caller that must grade any legal answer needs them all.
     all_results: bool = False
+    # The per-roll grid on every turn, from the luck analysis the turn already
+    # makes. Off by default: a caller that does not ask sees nothing new, and
+    # every other field stays byte-identical.
+    rolls: bool = False
 
 
 def can_double(turn: Turn) -> bool:
@@ -216,6 +220,48 @@ def count(bucket: dict, key: str | None) -> None:
         bucket[key] = bucket.get(key, 0) + 1
 
 
+# Per-roll details are 3-ply at most. bgsage corrupts a cube analysis asked
+# for them above that: nondeterministic between runs, about 0.09 low on ND and
+# 0.20 low on DT, and it flips a cube decision -- measured over eight boards
+# against long rollouts (the Aveline doc `bgsage-gotchas`). The refusal lives
+# here, where the call is made, rather than in a caller's good manners.
+DETAILS_MAX_PLY = 3
+
+
+def cube_details(analyzer, level: str, board: list[int], **match):
+    """The one call in this service that asks bgsage for per-roll details."""
+    if _PLY.get(level, DETAILS_MAX_PLY + 1) > DETAILS_MAX_PLY:
+        raise ValueError(
+            f"per-roll details corrupt a cube analysis above "
+            f"{DETAILS_MAX_PLY}-ply; {level} was asked for"
+        )
+    return analyzer(level).cube_action(board, incl_2ply_details=True, **match)
+
+
+def roll_rows(analysis, board: list[int], level: str) -> dict:
+    """The 21 rolls of a cube analysis, as the grid draws them.
+
+    `equity` at the top is the analysis's own `equity_nd`, which the rows'
+    weighted mean equals: the headline is the average of the cells beneath it.
+    Only the `nd` rows are offered -- `dt` is on another scale once the cube is
+    owned or there is a match score, and nothing has worked out its units.
+
+    The nested `opponent_rolls`, the probabilities and the post-move boards are
+    dropped: 441 sub-entries per call that no grid draws.
+    """
+    rows = []
+    for e in (analysis.details or {}).get("nd") or []:
+        d1, d2 = e["die1"], e["die2"]
+        rows.append({
+            "dice": [d1, d2],
+            # A double is one of 36, any other roll is two.
+            "weight": 1 if d1 == d2 else 2,
+            "equity": e["cubeful_equity"],
+            "best": compute_move_notation(board, e["checkers"], d1, d2),
+        })
+    return {"level": level, "equity": analysis.equity_nd, "rows": rows}
+
+
 def luck_level(cube_level: str) -> str | None:
     """The cube analysis luck is read from, or None when there is no luck to be had.
 
@@ -288,17 +334,32 @@ def analyze_turn(index: int, turn: Turn, req: ReviewRequest, analyzer) -> dict:
 
     lucky = luck_level(req.cube_level) if req.include_luck and turn.dice is not None else None
     cube_analysis = luck_analysis = None
+    # Which analysis the per-roll rows came from, so the grid can say how deep
+    # it looked. The rows are one ply shallower than the analysis that carries
+    # them, which is what `roll_rows` reports.
+    details_level = None
     if can_double(turn):
         # A post-take turn rolls on a cube the graded analysis knows nothing
         # about, so luck cannot ride along on it: it gets its own analysis.
         shared = lucky == req.cube_level and not post_take
-        cube_analysis = analyzer(req.cube_level).cube_action(
-            turn.board, incl_2ply_details=shared, **match)
-        out["cube"] = review_cube(turn, cube_analysis)
         if shared:
-            luck_analysis = cube_analysis
+            cube_analysis = cube_details(analyzer, req.cube_level, turn.board, **match)
+            luck_analysis, details_level = cube_analysis, req.cube_level
+        else:
+            cube_analysis = analyzer(req.cube_level).cube_action(turn.board, **match)
+        out["cube"] = review_cube(turn, cube_analysis)
     if lucky and luck_analysis is None:
-        luck_analysis = analyzer(lucky).cube_action(turn.board, incl_2ply_details=True, **play)
+        luck_analysis = cube_details(analyzer, lucky, turn.board, **play)
+        details_level = lucky
+
+    if req.rolls:
+        rolls_analysis, rolls_level = luck_analysis, details_level
+        if rolls_analysis is None:
+            # A turn nobody rolled has no luck, but it still has a grid: these
+            # are the rolls that are about to be thrown.
+            rolls_level = LUCK_LEVEL
+            rolls_analysis = cube_details(analyzer, rolls_level, turn.board, **play)
+        out["rolls"] = roll_rows(rolls_analysis, turn.board, rolls_level)
 
     if turn.dice is not None:
         d1, d2 = turn.dice

@@ -6,7 +6,8 @@ from fastapi.testclient import TestClient
 
 from app import pool
 from app.main import analyzer, app
-from app.review import ReviewRequest, analyze_serially, review_game
+from app.review import (ReviewRequest, analyze_serially, cube_details,
+                        review_game)
 
 client = TestClient(app)
 START = bgsage.STARTING_BOARD
@@ -536,3 +537,72 @@ def test_without_an_index_a_lone_turn_reads_as_the_opening_roll():
     # pairs, not over every roll, so the same dice are worth different luck.
     assert placed["luck"] is not None and alone["luck"] is not None
     assert placed["luck"] != alone["luck"]
+
+
+# ---------- the per-roll grid ----------
+
+
+def grid_sanity(grid: dict, board: list[int]) -> None:
+    """What every grid owes, whatever board it came from."""
+    rows = grid["rows"]
+    assert len(rows) == 21                                   # a <= b, doubles once
+    assert {tuple(r["dice"]) for r in rows} == {
+        (a, b) for a in range(1, 7) for b in range(a, 7)}
+    assert sum(r["weight"] for r in rows) == 36              # the whole of the dice
+    for r in rows:
+        d1, d2 = r["dice"]
+        assert r["weight"] == (1 if d1 == d2 else 2)
+        assert isinstance(r["best"], str)
+    # The headline is the average of the cells beneath it. This is the property
+    # the page leans on, so it is checked rather than assumed.
+    mean = sum(r["weight"] * r["equity"] for r in rows) / 36
+    assert mean == pytest.approx(grid["equity"], abs=1e-6)
+
+
+def test_rolls_never_come_from_a_4ply_analysis():
+    # The whole point of the flag's guard: a 4-ply cube analysis asked for
+    # per-roll details is corrupt, so asking for rolls must not create one.
+    turns = self_play(4, max_turns=2)
+    rec = Recorder()
+    body = review_game(
+        ReviewRequest.model_validate({"turns": turns, "rolls": True}),
+        analyze_serially(rec))
+    assert rec.calls == [("4ply", False), ("3ply", True)] * 2
+    assert all(t["rolls"]["level"] == "3ply" for t in body["turns"])
+
+    # And the door itself refuses, whoever knocks.
+    with pytest.raises(ValueError, match="corrupt"):
+        cube_details(analyzer, "4ply", list(START))
+
+
+def test_rolls_are_the_rolls():
+    turns = self_play(7, max_turns=3)
+    body = review_game(
+        ReviewRequest.model_validate(
+            {"turns": turns, "cube_level": "2ply", "move_level": "2ply", "rolls": True}),
+        analyze_serially(analyzer))
+    for turn, sent in zip(body["turns"], turns):
+        grid_sanity(turn["rolls"], sent["board"])
+
+
+def test_a_turn_nobody_rolled_still_has_a_grid():
+    # No dice means no luck, and the grid is asked for on its own: these are
+    # the rolls about to be thrown.
+    turn = {"player": 0, "board": list(START), "doubled": True, "response": "pass"}
+    body = review_game(
+        ReviewRequest.model_validate(
+            {"turns": [turn], "cube_level": "2ply", "rolls": True}),
+        analyze_serially(analyzer))
+    assert body["turns"][0]["luck"] is None
+    grid_sanity(body["turns"][0]["rolls"], turn["board"])
+
+
+def test_without_the_flag_nothing_changes():
+    turns = self_play(11, max_turns=3)
+    ask = {"turns": turns, "cube_level": "2ply", "move_level": "2ply"}
+    plain = review_game(ReviewRequest.model_validate(ask), analyze_serially(analyzer))
+    asked = review_game(ReviewRequest.model_validate({**ask, "rolls": True}),
+                        analyze_serially(analyzer))
+    assert all("rolls" not in t for t in plain["turns"])
+    # Byte-identical but for the new key: the grid is additive, not a rewrite.
+    assert [{k: v for k, v in t.items() if k != "rolls"} for t in asked["turns"]] == plain["turns"]

@@ -1,4 +1,5 @@
 import bgsage
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main, pool
@@ -97,3 +98,51 @@ def test_match_play_cube():
     r = client.post("/backgammon/cube", json={"board": START, "away1": 2, "away2": 2, "level": "1ply"})
     assert r.status_code == 200
     assert r.json()["optimal_action"] in ("No Double", "Double/Take", "Double/Pass")
+
+
+# ---------- /backgammon/rolls ----------
+
+
+def test_rolls_gives_a_row_per_roll():
+    r = client.post("/backgammon/rolls", json={"board": START, "level": "2ply"})
+    assert r.status_code == 200
+    body = r.json()
+    rows = body["rows"]
+    assert len(rows) == 21
+    assert sum(row["weight"] for row in rows) == 36
+    assert body["level"] == "2ply"
+    mean = sum(row["weight"] * row["equity"] for row in rows) / 36
+    assert mean == pytest.approx(body["equity"], abs=1e-6)
+    # Every row says what it would play, which is what the map writes in a cell.
+    assert all(row["best"] for row in rows)
+
+
+def test_rolls_refuses_the_depths_that_cannot_work():
+    # 4-ply details corrupt the analysis; 1-ply has no per-roll layer at all.
+    # Both are refused by the type, before a board reaches the engine.
+    for level in ("4ply", "1ply", "rollout"):
+        r = client.post("/backgammon/rolls", json={"board": START, "level": level})
+        assert r.status_code == 422, level
+
+
+def test_rolls_takes_a_board_with_a_checker_on_the_bar():
+    # /moves and /cube refuse this board; a grid must not, because it happens
+    # several times a game (bgsage-gotchas).
+    board = list(START)
+    board[0] = 1          # the opponent's bar, as bgsage counts it
+    board[19] = -4
+    r = client.post("/backgammon/rolls", json={"board": board, "level": "2ply"})
+    assert r.status_code == 200, r.text
+    assert len(r.json()["rows"]) == 21
+    assert client.post("/backgammon/cube", json={"board": board, "level": "1ply"}).status_code == 422
+
+
+def test_rolls_in_a_batch_matches_the_lone_route():
+    ask = {"board": START, "level": "2ply"}
+    one = client.post("/backgammon/rolls", json=ask).json()
+    batched = client.post("/backgammon/batch", json={
+        "items": [{"kind": "rolls", "request": ask}, {"kind": "rolls", "request": ask}],
+    })
+    assert batched.status_code == 200
+    results = batched.json()["results"]
+    assert results == [one, one]

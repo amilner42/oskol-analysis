@@ -29,8 +29,9 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from app import forward, pool
-from app.review import (CUBE_LEVEL, LEVELS, MOVE_LEVEL, Level, ReviewRequest,
-                        analyze_serially, review_game)
+from app.review import (CUBE_LEVEL, LEVELS, LUCK_LEVEL, MOVE_LEVEL, Level,
+                        ReviewRequest, analyze_serially, cube_details,
+                        review_game, roll_rows)
 
 Owner = Literal["centered", "player", "opponent"]
 
@@ -148,8 +149,43 @@ class PositionRequest(Position):
     """A post-move position: evaluated for the player who just moved."""
 
 
+# Details are 3-ply at most (see `review.cube_details`), and 1-ply carries no
+# per-roll layer at all. Spelling the usable depths as the type refuses
+# anything else with a 422, before a board reaches the engine.
+DetailsLevel = Literal["2ply", "3ply"]
+
+
+class RollsRequest(BaseModel):
+    """One board's per-roll grid, for the player on roll.
+
+    Deliberately not a `Position`: that model refuses any board with a checker
+    on either bar, which is a perfectly legal position several times a game and
+    is why `/moves` and `/cube` 422 on one (the Aveline doc `bgsage-gotchas`).
+    This validates as a review's `Turn.board` does -- 26 ints and nothing more.
+    """
+
+    board: list[int] = Field(min_length=26, max_length=26)
+    cube_value: int = 1
+    cube_owner: Owner = "centered"
+    away1: int = 0
+    away2: int = 0
+    is_crawford: bool = False
+    jacoby: bool = True
+    level: DetailsLevel = LUCK_LEVEL
+
+    def match_kwargs(self) -> dict:
+        return dict(
+            cube_value=self.cube_value,
+            cube_owner=self.cube_owner,
+            away1=self.away1,
+            away2=self.away2,
+            is_crawford=self.is_crawford,
+            jacoby=self.jacoby,
+        )
+
+
 class BatchItem(BaseModel):
-    kind: Literal["moves", "cube", "position"]
+    kind: Literal["moves", "cube", "position", "rolls"]
     request: dict
 
 
@@ -172,6 +208,11 @@ def _cube(req: CubeRequest, engines: Engines) -> dict:
 
 def _position(req: PositionRequest, engines: Engines) -> dict:
     return asdict(engines(req.level).post_move_analytics(req.board, **req.match_kwargs()))
+
+
+def _rolls(req: RollsRequest, engines: Engines) -> dict:
+    analysis = cube_details(engines, req.level, req.board, **req.match_kwargs())
+    return roll_rows(analysis, req.board, req.level)
 
 
 @backgammon.post("/review")
@@ -258,10 +299,22 @@ def position(req: PositionRequest) -> dict:
     return _position(req, solo_analyzer)
 
 
+@backgammon.post("/rolls")
+def rolls(req: RollsRequest) -> dict:
+    """How each of the 21 distinct rolls fares from here, for the player on roll.
+
+    The grid behind a temperature map: one row per roll with the engine's best
+    play for it, its equity, and how many of the 36 it stands for. The top-level
+    equity is the weighted mean of the rows.
+    """
+    return _rolls(req, solo_analyzer)
+
+
 _KINDS = {
     "moves": (MovesRequest, _moves),
     "cube": (CubeRequest, _cube),
     "position": (PositionRequest, _position),
+    "rolls": (RollsRequest, _rolls),
 }
 
 
