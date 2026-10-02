@@ -44,6 +44,7 @@ quick setting; `/review` defaults to `4ply` for both.
 |-------|--------------|---------|
 | `POST /backgammon/moves` | `dice: [d1, d2]`, `include_game_plans` | every legal play best first: `board`, `equity`, `cubeless_equity`, `equity_diff`, `probs` |
 | `POST /backgammon/cube` | | `equity_nd`, `equity_dt`, `equity_dp`, `should_double`, `should_take`, `optimal_action`, `probs` |
+| `POST /backgammon/rolls` | | how each of the 21 distinct rolls fares from a board, for the player on roll: one row per roll with the engine's best play, its equity, and how many of the 36 it stands for |
 | `POST /backgammon/position` | | a post-move position, for the player who just moved: `cubeful_equity`, `cubeless_equity`, `probs` |
 | `POST /backgammon/review` | `turns`, `jacoby`, `move_level`, `cube_level`, `top_moves`, `all_results`, `include_luck` | a whole game graded, see below |
 | `POST /backgammon/batch` | `items: [{kind, request}]` | `results` in the same order; a bad item 422s the whole batch first |
@@ -126,6 +127,26 @@ Each turn comes back with:
   `level_label`): bgsage's 4-ply cube analysis goes wrong when asked for
   those per-roll details, so at 4-ply the graded cube analysis runs without
   them and luck gets its own 3-ply one.
+- `rolls` (only with `"rolls": true`): the same per-roll detail luck is read
+  from, kept rather than discarded — `{level, equity, rows}` with 21 rows,
+  `{dice, weight, equity, best}`, a <= b and doubles first, `weight` 1 for a
+  double and 2 otherwise so the 21 stand for all 36. `equity` at the top is
+  the analysis's own no-double equity, and **the rows' weighted mean equals
+  it**: the headline is the average of the cells beneath it. Only the
+  no-double rows are offered; the double/take rows are on another scale once
+  the cube is owned or there is a match score. The nested `opponent_rolls`,
+  the probabilities and the post-move boards are dropped — 441 sub-entries a
+  call that no grid draws. A turn with no dice has no luck but still gets a
+  grid, from a 3-ply call of its own.
+
+**Per-roll details are 3-ply at most, and that rule lives in the service.**
+`review.cube_details` is the one function that passes `incl_2ply_details`,
+and it raises above 3-ply. A 4-ply cube analysis asked for details is
+corrupt rather than merely imprecise: nondeterministic between runs, about
+0.09 low on ND and 0.20 low on DT, and it takes the wrong side of a cube
+decision — measured over eight boards against long rollouts. 1-ply has no
+per-roll layer at all, so `/backgammon/rolls` accepts `2ply` and `3ply` and
+422s anything else before a board reaches the engine.
 
 `players[0]` and `players[1]` total it up: move decisions (forced ones
 excluded), errors, grade counts, cube decisions and mistakes, luck, and
